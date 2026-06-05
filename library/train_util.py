@@ -2215,6 +2215,42 @@ class DreamBoothDataset(BaseDataset):
                 continue
 
             img_paths, captions, sizes = load_dreambooth_dir(subset)
+            ref_paths_by_target = {}
+            if len(img_paths) > 0:
+                ref_suffix_pattern = re.compile(r"_ref\d*$")
+                target_paths_by_stem = {
+                    os.path.splitext(path)[0]: path
+                    for path in img_paths
+                    if ref_suffix_pattern.search(os.path.splitext(path)[0]) is None
+                }
+                filtered_img_paths = []
+                filtered_captions = []
+                filtered_sizes = []
+                for img_path, caption, size in zip(img_paths, captions, sizes):
+                    stem, _ = os.path.splitext(img_path)
+                    ref_match = ref_suffix_pattern.search(stem)
+                    if ref_match is not None:
+                        target_path = target_paths_by_stem.get(stem[: ref_match.start()])
+                        if target_path is not None:
+                            ref_paths_by_target.setdefault(target_path, []).append(img_path)
+                            continue
+                    filtered_img_paths.append(img_path)
+                    filtered_captions.append(caption)
+                    filtered_sizes.append(size)
+                if len(filtered_img_paths) < len(img_paths):
+                    logger.info(f"found {len(img_paths) - len(filtered_img_paths)} *_ref images as reference images in {subset.image_dir}")
+                def ref_sort_key(path):
+                    stem = os.path.splitext(path)[0]
+                    match = ref_suffix_pattern.search(stem)
+                    if match is None:
+                        return (stem, 0)
+                    suffix = match.group(0)
+                    ref_index = int(suffix[4:]) if len(suffix) > 4 else 0
+                    return (stem[: match.start()], ref_index, path)
+
+                for ref_paths in ref_paths_by_target.values():
+                    ref_paths.sort(key=ref_sort_key)
+                img_paths, captions, sizes = filtered_img_paths, filtered_captions, filtered_sizes
             if len(img_paths) < 1:
                 logger.warning(
                     f"ignore subset with image_dir='{subset.image_dir}': no images found / 画像が見つからないためサブセットを無視します"
@@ -2227,7 +2263,15 @@ class DreamBoothDataset(BaseDataset):
                 num_train_images += num_repeats * len(img_paths)
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
-                info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path, subset.caption_dropout_rate)
+                info = ImageInfo(
+                    img_path,
+                    num_repeats,
+                    caption,
+                    subset.is_reg,
+                    img_path,
+                    subset.caption_dropout_rate,
+                    reference_image_paths=ref_paths_by_target.get(img_path, []),
+                )
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 )
