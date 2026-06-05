@@ -1,27 +1,26 @@
-accelerate==1.6.0
-transformers==4.54.1
-diffusers[torch]==0.32.1
-ftfy==6.3.1
+accelerate
+transformers
+diffusers[torch]
+ftfy
 # albumentations==1.3.0
-opencv-python==4.10.0.84
-einops==0.7.0
+opencv-python
+einops
 # pytorch-lightning==1.9.0
 bitsandbytes
-lion-pytorch==0.2.3
-schedulefree==1.4
-pytorch-optimizer==3.10.0
-prodigy-plus-schedule-free==1.9.2
-prodigyopt==1.1.2
+lion-pytorch
+schedulefree
+pytorch-optimizer
+prodigy-plus-schedule-free
+prodigyopt
 tensorboard
-safetensors==0.4.5
+safetensors
 # gradio==3.16.2
 # altair==4.2.2
 # easygui==0.98.3
-toml==0.10.2
-voluptuous==0.15.2
-huggingface-hub==0.34.3
+toml
+voluptuous
 # for Image utils
-imagesize==1.4.1
+imagesize
 numpy
 # <=2.0
 # for BLIP captioning
@@ -42,8 +41,8 @@ numpy
 # open clip for SDXL
 # open-clip-torch==2.20.0
 # For logging
-rich==14.1.0
+rich
 # for T5XXL tokenizer (SD3/FLUX)
-sentencepiece==0.2.1
+sentencepiece
 # for kohya_ss library
 -e .
