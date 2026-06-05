@@ -1,0 +1,30 @@
+accelerate launch anima_train_network.py \
+  --pretrained_model_name_or_path /root/autodl-tmp/ComfyUI/models/diffusion_models/anima-base-v1.0.safetensors \
+  --vae /root/autodl-tmp/ComfyUI/models/vae/qwen_image_vae.safetensors \
+  --qwen3 /root/autodl-tmp/ckn/qwen3 \
+  --t5_tokenizer_path configs/t5_old \
+  --train_data_dir /root/autodl-tmp/ckn/downloaded_images \
+  --output_dir out \
+  --output_name anima_self_ref_overfit \
+  --network_module networks.lora_anima \
+  --network_dim 128 \
+  --network_alpha 128 \
+  --network_train_unet_only \
+  --learning_rate 1e-4 \
+  --optimizer_type AdamW \
+  --max_train_steps 5000000 \
+  --train_batch_size 2 \
+  --mixed_precision bf16 \
+  --save_precision bf16 \
+  --resolution 1024,1024 \
+  --enable_bucket \
+  --caption_extension .txt \
+  --anima_multi_image_edit \
+  --anima_self_reference_test \
+  --gradient_checkpointing \
+  --log_with wandb \
+  --logging_dir logs \
+  --log_tracker_name anima-edit \
+  --wandb_run_name anima_self_ref_overfit \
+  --sample_every_n_steps 100 \
+  --anima_sample_reference_dir /root/autodl-tmp/ckn/test \

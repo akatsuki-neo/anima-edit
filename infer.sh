@@ -1,0 +1,12 @@
+python anima_minimal_inference.py \
+  --dit /path/to/anima/dit.safetensors \
+  --vae /path/to/anima/vae.safetensors \
+  --text_encoder /path/to/qwen3_06b \
+  --lora_weight /path/to/edit_lora.safetensors \
+  --lora_multiplier 1.0 \
+  --prompt "combine the identity and style references" \
+  --reference_image /path/to/id.png /path/to/style.png \
+  --image_size 1024 1024 \
+  --infer_steps 30 \
+  --guidance_scale 3.5 \
+  --save_path /path/to/infer_outputs
