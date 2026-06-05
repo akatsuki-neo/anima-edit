@@ -149,7 +149,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--anima_reference_max_area",
         type=int,
-        default=1024 * 1024,
+        default=2048 * 2048,
         help="Maximum reference image area before aspect-preserving downscale. Set 0 to disable.",
     )
     parser.add_argument(
