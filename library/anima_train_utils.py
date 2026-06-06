@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 from typing import Optional
@@ -571,21 +572,51 @@ def do_sample(
 
 def _load_reference_sample_prompts(sample_reference_dir: str) -> list[dict]:
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    ref_suffix_re = re.compile(r"_ref\d*$", re.IGNORECASE)
     prompts = []
     for root, _, files in os.walk(sample_reference_dir):
+        image_by_stem = {}
+        txt_by_stem = {}
         for filename in sorted(files):
-            image_path = os.path.join(root, filename)
-            stem, ext = os.path.splitext(image_path)
+            path = os.path.join(root, filename)
+            _, ext = os.path.splitext(path)
+            stem_name = os.path.splitext(filename)[0]
             if ext.lower() not in image_exts:
+                if ext.lower() == ".txt":
+                    txt_by_stem[stem_name] = path
                 continue
-            txt_path = stem + ".txt"
+
+            # Use one image per stem if multiple extensions exist, and never treat
+            # *_ref / *_ref1 / *_ref2 images as standalone sample prompts.
+            image_by_stem.setdefault(stem_name, path)
+
+        for stem_name in sorted(image_by_stem):
+            if ref_suffix_re.search(stem_name):
+                continue
+            image_path = image_by_stem[stem_name]
+            txt_path = txt_by_stem.get(stem_name)
+            if txt_path is None:
+                txt_path = os.path.splitext(image_path)[0] + ".txt"
             if not os.path.isfile(txt_path):
                 continue
             with open(txt_path, "r", encoding="utf-8") as f:
                 prompt = f.read().strip()
             if not prompt:
                 continue
-            prompts.append({"prompt": prompt, "image": image_path})
+
+            ref_paths = []
+            direct_ref = image_by_stem.get(f"{stem_name}_ref")
+            if direct_ref is not None:
+                ref_paths.append(direct_ref)
+            ref_index = 1
+            while True:
+                ref_path = image_by_stem.get(f"{stem_name}_ref{ref_index}")
+                if ref_path is None:
+                    break
+                ref_paths.append(ref_path)
+                ref_index += 1
+
+            prompts.append({"prompt": prompt, "image": ref_paths or image_path})
     return prompts
 
 
