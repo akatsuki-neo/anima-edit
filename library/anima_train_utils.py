@@ -203,7 +203,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--anima_multi_image_edit",
         action="store_true",
-        help="Enable Flux2 Klein-style multi-image reference conditioning for Anima training.",
+        help="Enable multi-image reference conditioning for Anima training.",
     )
     parser.add_argument(
         "--anima_ip_adapter",
