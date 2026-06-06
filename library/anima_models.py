@@ -383,13 +383,11 @@ class AnimaIPAdapter(nn.Module):
         self.feature_dim = feature_dim
         self.num_feature_tokens = num_feature_tokens
         self.feature_proj = (
-            nn.Sequential(
-                nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True),
-                nn.LayerNorm(hidden_size * num_feature_tokens),
-            )
+            nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True)
             if feature_dim is not None
             else None
         )
+        self.feature_norm = nn.LayerNorm(hidden_size) if feature_dim is not None else None
         self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=True)
         self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=True)
         self.reset_parameters()
@@ -398,8 +396,9 @@ class AnimaIPAdapter(nn.Module):
         std = 1.0 / math.sqrt(self.hidden_size)
         if self.feature_proj is not None:
             feature_std = 1.0 / math.sqrt(self.feature_dim)
-            torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
-            torch.nn.init.zeros_(self.feature_proj[0].bias)
+            torch.nn.init.trunc_normal_(self.feature_proj.weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
+            torch.nn.init.zeros_(self.feature_proj.bias)
+            self.feature_norm.reset_parameters()
         torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
         torch.nn.init.zeros_(self.to_v_ip.weight)
         torch.nn.init.zeros_(self.to_k_ip.bias)
@@ -412,6 +411,8 @@ class AnimaIPAdapter(nn.Module):
             features = features.unsqueeze(1)
         batch, num_refs, dim = features.shape
         tokens = self.feature_proj(features.reshape(batch * num_refs, dim))
+        tokens = tokens.reshape(batch * num_refs, self.num_feature_tokens, self.hidden_size)
+        tokens = self.feature_norm(tokens)
         tokens = tokens.reshape(batch, num_refs * self.num_feature_tokens, self.hidden_size)
         return tokens
 
