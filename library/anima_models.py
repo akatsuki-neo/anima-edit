@@ -390,10 +390,8 @@ class AnimaIPAdapter(nn.Module):
             if feature_dim is not None
             else None
         )
-        self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-        self.v_norm = nn.Identity()
+        self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=True)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -403,9 +401,9 @@ class AnimaIPAdapter(nn.Module):
             torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
             torch.nn.init.zeros_(self.feature_proj[0].bias)
         torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.zeros_(self.to_v_ip.weight)
-        if hasattr(self.k_norm, "reset_parameters"):
-            self.k_norm.reset_parameters()
+        torch.nn.init.trunc_normal_(self.to_v_ip.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.to_k_ip.bias)
+        torch.nn.init.zeros_(self.to_v_ip.bias)
 
     def project_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.feature_proj is None:
@@ -431,8 +429,6 @@ class AnimaIPAdapter(nn.Module):
         q = query[:, :query_len] if query_len is not None else query
         k = rearrange(self.to_k_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
         v = rearrange(self.to_v_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
 
         if q.dtype != v.dtype:
             if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
@@ -1114,16 +1110,12 @@ class Block(nn.Module):
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_self_attn, scale_self, shift_self)
         result = self.self_attn(normalized_x, attn_params, None, rope_emb=rope_emb_L_1_1_D)
+        ip_result = None
         if self.ip_adapter is not None and ip_adapter_tokens is not None:
             ip_query = self.self_attn.q_proj(normalized_x)
             ip_query = rearrange(ip_query, "b l (h d) -> b l h d", h=self.self_attn.n_heads, d=self.self_attn.head_dim)
             ip_query = self.self_attn.q_norm(ip_query)
             ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
-            if ip_adapter_query_len is None or ip_adapter_query_len == result.shape[1]:
-                result = result + ip_result
-            else:
-                result = result.clone()
-                result[:, :ip_adapter_query_len] = result[:, :ip_adapter_query_len] + ip_result
         x_B_L_D = x_B_L_D + expand_param(gate_self) * result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
@@ -1133,6 +1125,12 @@ class Block(nn.Module):
         normalized_x = adaln(x_B_L_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
         result = self.mlp(normalized_x)
         x_B_L_D = x_B_L_D + expand_param(gate_mlp) * result
+        if ip_result is not None:
+            if ip_adapter_query_len is None or ip_adapter_query_len == x_B_L_D.shape[1]:
+                x_B_L_D = x_B_L_D + ip_result
+            else:
+                x_B_L_D = x_B_L_D.clone()
+                x_B_L_D[:, :ip_adapter_query_len] = x_B_L_D[:, :ip_adapter_query_len] + ip_result
         return x_B_L_D
 
     def forward(
