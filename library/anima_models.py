@@ -374,22 +374,48 @@ class Attention(nn.Module):
 
 
 class AnimaIPAdapter(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, scale: float = 1.0):
+    def __init__(self, hidden_size: int, num_heads: int, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = scale
-        self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.feature_dim = feature_dim
+        self.num_feature_tokens = num_feature_tokens
+        self.feature_proj = (
+            nn.Sequential(
+                nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True),
+                nn.LayerNorm(hidden_size * num_feature_tokens),
+            )
+            if feature_dim is not None
+            else None
+        )
+        self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.v_norm = nn.Identity()
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
+        if self.feature_proj is not None:
+            feature_std = 1.0 / math.sqrt(self.feature_dim)
+            torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
+            torch.nn.init.zeros_(self.feature_proj[0].bias)
         torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
         torch.nn.init.zeros_(self.to_v_ip.weight)
-        torch.nn.init.zeros_(self.to_k_ip.bias)
-        torch.nn.init.zeros_(self.to_v_ip.bias)
+        if hasattr(self.k_norm, "reset_parameters"):
+            self.k_norm.reset_parameters()
+
+    def project_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.feature_proj is None:
+            raise ValueError("This AnimaIPAdapter was not initialized with feature_dim.")
+        if features.ndim == 2:
+            features = features.unsqueeze(1)
+        batch, num_refs, dim = features.shape
+        tokens = self.feature_proj(features.reshape(batch * num_refs, dim))
+        tokens = tokens.reshape(batch, num_refs * self.num_feature_tokens, self.hidden_size)
+        return tokens
 
     def forward(
         self,
@@ -405,6 +431,8 @@ class AnimaIPAdapter(nn.Module):
         q = query[:, :query_len] if query_len is not None else query
         k = rearrange(self.to_k_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
         v = rearrange(self.to_v_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
         if q.dtype != v.dtype:
             if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
@@ -942,6 +970,8 @@ class Block(nn.Module):
                 self.x_dim,
                 self.self_attn.n_heads,
                 scale=scale,
+                feature_dim=feature_dim,
+                num_feature_tokens=num_feature_tokens,
             )
         else:
             self.ip_adapter.scale = scale
@@ -1084,19 +1114,17 @@ class Block(nn.Module):
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_self_attn, scale_self, shift_self)
         result = self.self_attn(normalized_x, attn_params, None, rope_emb=rope_emb_L_1_1_D)
-        ip_result = None
         if self.ip_adapter is not None and ip_adapter_tokens is not None:
             ip_query = self.self_attn.q_proj(normalized_x)
             ip_query = rearrange(ip_query, "b l (h d) -> b l h d", h=self.self_attn.n_heads, d=self.self_attn.head_dim)
             ip_query = self.self_attn.q_norm(ip_query)
             ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
-        x_B_L_D = x_B_L_D + expand_param(gate_self) * result
-        if ip_result is not None:
-            if ip_adapter_query_len is None or ip_adapter_query_len == x_B_L_D.shape[1]:
-                x_B_L_D = x_B_L_D + ip_result
+            if ip_adapter_query_len is None or ip_adapter_query_len == result.shape[1]:
+                result = result + ip_result
             else:
-                x_B_L_D = x_B_L_D.clone()
-                x_B_L_D[:, :ip_adapter_query_len] = x_B_L_D[:, :ip_adapter_query_len] + ip_result
+                result = result.clone()
+                result[:, :ip_adapter_query_len] = result[:, :ip_adapter_query_len] + ip_result
+        x_B_L_D = x_B_L_D + expand_param(gate_self) * result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
         result = self.cross_attn(normalized_x, attn_params, crossattn_emb, rope_emb=rope_emb_L_1_1_D)
@@ -1342,9 +1370,6 @@ class Anima(nn.Module):
 
         self.build_patch_embed()
         self.build_pos_embed()
-        self.ip_adapter_feature_proj: Optional[nn.Linear] = None
-        self.ip_adapter_feature_norm: Optional[nn.LayerNorm] = None
-        self.ip_adapter_num_feature_tokens = 0
         self.use_adaln_lora = use_adaln_lora
         self.adaln_lora_dim = adaln_lora_dim
         self.t_embedder = nn.Sequential(
@@ -1510,33 +1535,13 @@ class Anima(nn.Module):
         return rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d"), ids, (T, H, W)
 
     def enable_ip_adapter(self, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4) -> None:
-        if feature_dim is not None:
-            self.ip_adapter_feature_proj = nn.Linear(feature_dim, self.model_channels * num_feature_tokens, bias=True)
-            self.ip_adapter_feature_norm = nn.LayerNorm(self.model_channels)
-            self.ip_adapter_num_feature_tokens = num_feature_tokens
-            feature_std = 1.0 / math.sqrt(feature_dim)
-            torch.nn.init.trunc_normal_(
-                self.ip_adapter_feature_proj.weight,
-                std=feature_std,
-                a=-3 * feature_std,
-                b=3 * feature_std,
-            )
-            torch.nn.init.zeros_(self.ip_adapter_feature_proj.bias)
-            self.ip_adapter_feature_norm.reset_parameters()
-
         for block in self.blocks:
             block.enable_ip_adapter(scale, feature_dim=feature_dim, num_feature_tokens=num_feature_tokens)
 
     def project_ip_adapter_features(self, features: torch.Tensor) -> torch.Tensor:
-        if self.ip_adapter_feature_proj is None or self.ip_adapter_feature_norm is None:
+        if not self.blocks or self.blocks[0].ip_adapter is None:
             raise ValueError("IP-Adapter is not enabled.")
-        if features.ndim == 2:
-            features = features.unsqueeze(1)
-        batch, num_refs, dim = features.shape
-        tokens = self.ip_adapter_feature_proj(features.reshape(batch * num_refs, dim))
-        tokens = tokens.reshape(batch * num_refs, self.ip_adapter_num_feature_tokens, self.model_channels)
-        tokens = self.ip_adapter_feature_norm(tokens)
-        return tokens.reshape(batch, num_refs * self.ip_adapter_num_feature_tokens, self.model_channels)
+        return self.blocks[0].ip_adapter.project_features(features)
 
     def set_ip_adapter_scale(self, scale: float) -> None:
         for block in self.blocks:
