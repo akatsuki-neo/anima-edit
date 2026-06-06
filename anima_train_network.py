@@ -371,9 +371,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             )
 
     @staticmethod
+    def is_ip_adapter_parameter_name(name: str) -> bool:
+        return ".ip_adapter." in name or name.startswith("ip_adapter_feature_")
+
+    @staticmethod
     def get_ip_adapter_parameters(unet):
         for name, param in unet.named_parameters():
-            if ".ip_adapter." in name:
+            if AnimaNetworkTrainer.is_ip_adapter_parameter_name(name):
                 yield param
 
     def set_ip_adapter_trainable(self, unet, trainable: bool):
@@ -385,7 +389,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return {
             name: tensor.detach().cpu()
             for name, tensor in unet.state_dict().items()
-            if ".ip_adapter." in name
+            if AnimaNetworkTrainer.is_ip_adapter_parameter_name(name)
         }
 
     @staticmethod
@@ -410,7 +414,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         logger.info(f"loading Anima IP-Adapter weights: {file}")
         state_dict = load_file(file, device="cpu")
         info = unet.load_state_dict(state_dict, strict=False)
-        unexpected = [key for key in info.unexpected_keys if ".ip_adapter." not in key]
+        unexpected = [key for key in info.unexpected_keys if not self.is_ip_adapter_parameter_name(key)]
         if unexpected:
             raise ValueError(f"Unexpected keys while loading IP-Adapter: {unexpected}")
         return info
@@ -506,7 +510,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         has_grad = False
         with torch.no_grad():
             for name, param in unet.named_parameters():
-                if ".ip_adapter." not in name:
+                if not AnimaNetworkTrainer.is_ip_adapter_parameter_name(name):
                     continue
                 param_sq += param.detach().float().pow(2).sum().item()
                 if param.grad is not None:
