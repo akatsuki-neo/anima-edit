@@ -392,6 +392,7 @@ class AnimaVisualConditionAdapter(nn.Module):
         self.feature_norm = RMSNorm(feature_dim, eps=1e-6)
         self.source_proj = nn.Linear(feature_dim, hidden_size, bias=True)
         self.visual_queries = nn.Parameter(torch.empty(num_feature_tokens, hidden_size))
+        self.rotary_emb = AdapterRotaryEmbedding(hidden_size // num_heads)
         self.refiner = nn.ModuleList(
             [
                 LLMAdapterTransformerBlock(
@@ -441,8 +442,17 @@ class AnimaVisualConditionAdapter(nn.Module):
 
         source = self.source_proj(self.feature_norm(features))
         tokens = self.visual_queries.unsqueeze(0).expand(batch, -1, -1).to(dtype=source.dtype, device=source.device)
+        position_ids = torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0)
+        position_ids_source = torch.arange(source.shape[1], device=source.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(tokens, position_ids)
+        position_embeddings_source = self.rotary_emb(source, position_ids_source)
         for layer in self.refiner:
-            tokens = layer(tokens, source)
+            tokens = layer(
+                tokens,
+                source,
+                position_embeddings=position_embeddings,
+                position_embeddings_context=position_embeddings_source,
+            )
         return self.out_norm(tokens)
 
 
