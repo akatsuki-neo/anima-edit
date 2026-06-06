@@ -43,6 +43,7 @@ def load_anima_model(
     ip_adapter_scale: float = 1.0,
     ip_adapter_feature_dim: Optional[int] = None,
     ip_adapter_num_tokens: int = 4,
+    ip_adapter_linear_adapter: bool = False,
 ) -> anima_models.Anima:
     """
     Load Anima model from the specified checkpoint.
@@ -153,6 +154,7 @@ def load_anima_model(
             ip_adapter_scale,
             feature_dim=ip_adapter_feature_dim,
             num_feature_tokens=ip_adapter_num_tokens,
+            linear_adapter=ip_adapter_linear_adapter,
         )
         ip_adapter_dtype = dit_weight_dtype
         if model.visual_condition_adapter is not None:

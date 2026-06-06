@@ -382,6 +382,7 @@ class AnimaVisualConditionAdapter(nn.Module):
         num_feature_tokens: int = 4,
         num_layers: int = 3,
         mlp_ratio: float = 4.0,
+        linear_adapter: bool = False,
     ):
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -389,36 +390,46 @@ class AnimaVisualConditionAdapter(nn.Module):
         self.feature_dim = feature_dim
         self.hidden_size = hidden_size
         self.num_feature_tokens = num_feature_tokens
+        self.linear_adapter = linear_adapter
         self.feature_norm = RMSNorm(feature_dim, eps=1e-6)
-        self.source_proj = nn.Linear(feature_dim, hidden_size, bias=True)
-        self.visual_queries = nn.Parameter(torch.empty(num_feature_tokens, hidden_size))
-        self.rotary_emb = AdapterRotaryEmbedding(hidden_size // num_heads)
-        self.refiner = nn.ModuleList(
-            [
-                LLMAdapterTransformerBlock(
-                    source_dim=hidden_size,
-                    model_dim=hidden_size,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    self_attn=True,
-                    layer_norm=False,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.out_norm = LLMAdapterRMSNorm(hidden_size)
+        if self.linear_adapter:
+            self.feature_proj = nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True)
+            self.out_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        else:
+            self.source_proj = nn.Linear(feature_dim, hidden_size, bias=True)
+            self.visual_queries = nn.Parameter(torch.empty(num_feature_tokens, hidden_size))
+            self.rotary_emb = AdapterRotaryEmbedding(hidden_size // num_heads)
+            self.refiner = nn.ModuleList(
+                [
+                    LLMAdapterTransformerBlock(
+                        source_dim=hidden_size,
+                        model_dim=hidden_size,
+                        num_heads=num_heads,
+                        mlp_ratio=mlp_ratio,
+                        self_attn=True,
+                        layer_norm=False,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+            self.out_norm = LLMAdapterRMSNorm(hidden_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         self.feature_norm.reset_parameters()
         std = 1.0 / math.sqrt(self.feature_dim)
-        torch.nn.init.trunc_normal_(self.source_proj.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.zeros_(self.source_proj.bias)
-        query_std = 1.0 / math.sqrt(self.hidden_size)
-        torch.nn.init.trunc_normal_(self.visual_queries, std=query_std, a=-3 * query_std, b=3 * query_std)
-        for layer in self.refiner:
-            layer.init_weights()
-        self.out_norm.weight.data.fill_(1.0)
+        if self.linear_adapter:
+            torch.nn.init.trunc_normal_(self.feature_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.feature_proj.bias)
+            self.out_norm.reset_parameters()
+        else:
+            torch.nn.init.trunc_normal_(self.source_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.source_proj.bias)
+            query_std = 1.0 / math.sqrt(self.hidden_size)
+            torch.nn.init.trunc_normal_(self.visual_queries, std=query_std, a=-3 * query_std, b=3 * query_std)
+            for layer in self.refiner:
+                layer.init_weights()
+            self.out_norm.weight.data.fill_(1.0)
 
     def forward(
         self,
@@ -440,6 +451,12 @@ class AnimaVisualConditionAdapter(nn.Module):
         if num_features == 0:
             return features.new_zeros((batch, 0, self.hidden_size))
 
+        if self.linear_adapter:
+            pooled = features.mean(dim=1)
+            tokens = self.feature_proj(self.feature_norm(pooled))
+            tokens = tokens.reshape(batch, self.num_feature_tokens, self.hidden_size)
+            return self.out_norm(tokens)
+
         source = self.source_proj(self.feature_norm(features))
         tokens = self.visual_queries.unsqueeze(0).expand(batch, -1, -1).to(dtype=source.dtype, device=source.device)
         position_ids = torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0)
@@ -452,8 +469,60 @@ class AnimaVisualConditionAdapter(nn.Module):
                 source,
                 position_embeddings=position_embeddings,
                 position_embeddings_context=position_embeddings_source,
-            )
+        )
         return self.out_norm(tokens)
+
+    def uses_kv_injection(self) -> bool:
+        return self.linear_adapter
+
+
+class AnimaIPAdapter(nn.Module):
+    def __init__(self, query_dim: int, context_dim: int, num_heads: int, scale: float = 1.0):
+        super().__init__()
+        if query_dim % num_heads != 0:
+            raise ValueError(f"IP-Adapter query_dim ({query_dim}) must be divisible by num_heads ({num_heads}).")
+        self.query_dim = query_dim
+        self.context_dim = context_dim
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+        self.scale = scale
+        self.to_k_ip = nn.Linear(context_dim, query_dim, bias=False)
+        self.to_v_ip = nn.Linear(context_dim, query_dim, bias=False)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.v_norm = nn.Identity()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        std = 1.0 / math.sqrt(self.context_dim)
+        torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.to_v_ip.weight)
+        if hasattr(self.k_norm, "reset_parameters"):
+            self.k_norm.reset_parameters()
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        image_tokens: torch.Tensor,
+        attn_params: attention.AttentionParams,
+        query_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if image_tokens is None or image_tokens.shape[1] == 0 or self.scale == 0:
+            q = query[:, :query_len] if query_len is not None else query
+            return torch.zeros((q.shape[0], q.shape[1], self.query_dim), dtype=q.dtype, device=q.device)
+
+        q = query[:, :query_len] if query_len is not None else query
+        k = rearrange(self.to_k_ip(image_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
+        v = rearrange(self.to_v_ip(image_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
+
+        if q.dtype != v.dtype:
+            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+                q = q.to(v.dtype)
+                k = k.to(v.dtype)
+
+        result = attention.attention([q, k, v], attn_params=attn_params)
+        return result.to(query.dtype) * self.scale
 
 
 # Positional Embeddings
@@ -913,6 +982,7 @@ class Block(nn.Module):
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
+        self.ip_adapter: Optional[AnimaIPAdapter] = None
 
         self.use_adaln_lora = use_adaln_lora
         if self.use_adaln_lora:
@@ -973,12 +1043,32 @@ class Block(nn.Module):
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
         self.mlp.init_weights()
+        if self.ip_adapter is not None:
+            self.ip_adapter.reset_parameters()
 
-    def enable_ip_adapter(self, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4) -> None:
-        del scale, feature_dim, num_feature_tokens
+    def enable_ip_adapter(
+        self,
+        scale: float = 1.0,
+        feature_dim: Optional[int] = None,
+        num_feature_tokens: int = 4,
+        linear_adapter: bool = False,
+    ) -> None:
+        del feature_dim, num_feature_tokens
+        if not linear_adapter:
+            return
+        if self.ip_adapter is None:
+            self.ip_adapter = AnimaIPAdapter(
+                query_dim=self.x_dim,
+                context_dim=self.cross_attn.context_dim,
+                num_heads=self.self_attn.n_heads,
+                scale=scale,
+            )
+        else:
+            self.ip_adapter.scale = scale
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        del scale
+        if self.ip_adapter is not None:
+            self.ip_adapter.scale = scale
 
     def _forward(
         self,
@@ -1118,6 +1208,16 @@ class Block(nn.Module):
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
         result = self.cross_attn(normalized_x, attn_params, crossattn_emb, rope_emb=rope_emb_L_1_1_D)
+        if self.ip_adapter is not None and ip_adapter_tokens is not None:
+            ip_query = self.cross_attn.q_proj(normalized_x)
+            ip_query = rearrange(ip_query, "b l (h d) -> b l h d", h=self.cross_attn.n_heads, d=self.cross_attn.head_dim)
+            ip_query = self.cross_attn.q_norm(ip_query)
+            ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
+            if ip_adapter_query_len is None or ip_adapter_query_len == result.shape[1]:
+                result = result + ip_result
+            else:
+                result = result.clone()
+                result[:, :ip_adapter_query_len] = result[:, :ip_adapter_query_len] + ip_result
         x_B_L_D = x_B_L_D + expand_param(gate_cross) * result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
@@ -1526,8 +1626,13 @@ class Anima(nn.Module):
         ids = torch.cartesian_prod(t, h, w)
         return rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d"), ids, (T, H, W)
 
-    def enable_ip_adapter(self, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4) -> None:
-        del scale
+    def enable_ip_adapter(
+        self,
+        scale: float = 1.0,
+        feature_dim: Optional[int] = None,
+        num_feature_tokens: int = 4,
+        linear_adapter: bool = False,
+    ) -> None:
         if feature_dim is None:
             return
         if self.visual_condition_adapter is None:
@@ -1536,7 +1641,10 @@ class Anima(nn.Module):
                 hidden_size=self.crossattn_emb_channels,
                 num_heads=self.num_heads,
                 num_feature_tokens=num_feature_tokens,
+                linear_adapter=linear_adapter,
             )
+        for block in self.blocks:
+            block.enable_ip_adapter(scale, feature_dim=feature_dim, num_feature_tokens=num_feature_tokens, linear_adapter=linear_adapter)
 
     def project_ip_adapter_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.visual_condition_adapter is None:
@@ -1545,7 +1653,8 @@ class Anima(nn.Module):
         return self.visual_condition_adapter(features, attn_params)
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        del scale
+        for block in self.blocks:
+            block.set_ip_adapter_scale(scale)
 
     def _prepare_reference_flat_tokens(
         self,
@@ -1738,6 +1847,7 @@ class Anima(nn.Module):
                     ref_ids.append(ids)
 
                 visual_context_tokens = []
+                ip_tokens = None
                 visual_latent_tokens = []
                 visual_latent_ids = []
                 if ip_adapter_embeds is not None:
@@ -1746,7 +1856,13 @@ class Anima(nn.Module):
                     else:
                         sample_embeds = ip_adapter_embeds[batch_index : batch_index + 1]
                     tokens = self.project_ip_adapter_features(sample_embeds.to(x_i.device, x_i.dtype))
-                    visual_context_tokens.append(tokens)
+                    if (
+                        self.visual_condition_adapter is not None
+                        and self.visual_condition_adapter.uses_kv_injection()
+                    ):
+                        ip_tokens = tokens
+                    else:
+                        visual_context_tokens.append(tokens)
                 else:
                     for ref_index, ref_latent in enumerate((ip_adapter_latents[batch_index] if ip_adapter_latents is not None else []) or []):
                         if ref_latent.ndim == 4:
@@ -1789,8 +1905,8 @@ class Anima(nn.Module):
                         use_fp32,
                         rope_emb,
                         adaln_lora,
-                        ip_adapter_tokens=None,
-                        ip_adapter_query_len=None,
+                        ip_adapter_tokens=ip_tokens,
+                        ip_adapter_query_len=target_tokens.shape[1] if ip_tokens is not None else None,
                     )
                     if self.blocks_to_swap:
                         self.offloader.submit_move_blocks(self.blocks, block_idx)

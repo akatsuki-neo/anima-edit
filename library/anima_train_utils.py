@@ -256,7 +256,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--anima_ip_adapter_num_tokens",
         type=int,
         default=4,
-        help="Number of learned Anima tokens projected from each CCIP/LSNet feature vector.",
+        help="Number of Anima visual context tokens produced from CCIP/LSNet feature vectors.",
+    )
+    parser.add_argument(
+        "--linear-adapter",
+        "--anima_ip_adapter_linear_adapter",
+        dest="linear_adapter",
+        action="store_true",
+        help="Use a lightweight Linear + LayerNorm visual adapter instead of the transformer resampler.",
     )
     parser.add_argument(
         "--anima_disable_network_training",

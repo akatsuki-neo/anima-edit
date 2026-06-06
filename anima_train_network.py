@@ -259,6 +259,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             ip_adapter_scale=getattr(args, "anima_ip_adapter_scale", 1.0),
             ip_adapter_feature_dim=ip_feature_dim,
             ip_adapter_num_tokens=getattr(args, "anima_ip_adapter_num_tokens", 4),
+            ip_adapter_linear_adapter=getattr(args, "linear_adapter", False)
+            or getattr(args, "anima_ip_adapter_linear_adapter", False),
         )
 
         # Store unsloth preference so that when the base NetworkTrainer calls
@@ -372,7 +374,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     @staticmethod
     def is_ip_adapter_parameter_name(name: str) -> bool:
-        return name.startswith("visual_condition_adapter.")
+        return name.startswith("visual_condition_adapter.") or ".ip_adapter." in name
 
     @staticmethod
     def get_ip_adapter_parameters(unet):
