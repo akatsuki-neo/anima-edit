@@ -1091,6 +1091,12 @@ class Block(nn.Module):
             ip_query = self.self_attn.q_norm(ip_query)
             ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
         x_B_L_D = x_B_L_D + expand_param(gate_self) * result
+        if ip_result is not None:
+            if ip_adapter_query_len is None or ip_adapter_query_len == x_B_L_D.shape[1]:
+                x_B_L_D = x_B_L_D + ip_result
+            else:
+                x_B_L_D = x_B_L_D.clone()
+                x_B_L_D[:, :ip_adapter_query_len] = x_B_L_D[:, :ip_adapter_query_len] + ip_result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
         result = self.cross_attn(normalized_x, attn_params, crossattn_emb, rope_emb=rope_emb_L_1_1_D)
@@ -1099,12 +1105,6 @@ class Block(nn.Module):
         normalized_x = adaln(x_B_L_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
         result = self.mlp(normalized_x)
         x_B_L_D = x_B_L_D + expand_param(gate_mlp) * result
-        if ip_result is not None:
-            if ip_adapter_query_len is None or ip_adapter_query_len == x_B_L_D.shape[1]:
-                x_B_L_D = x_B_L_D + ip_result
-            else:
-                x_B_L_D = x_B_L_D.clone()
-                x_B_L_D[:, :ip_adapter_query_len] = x_B_L_D[:, :ip_adapter_query_len] + ip_result
         return x_B_L_D
 
     def forward(
