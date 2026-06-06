@@ -574,10 +574,16 @@ def _load_reference_sample_prompts(sample_reference_dir: str) -> list[dict]:
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     ref_suffix_re = re.compile(r"_ref\d*$", re.IGNORECASE)
     prompts = []
-    for root, _, files in os.walk(sample_reference_dir):
+    seen_targets = set()
+    for root, dirs, files in os.walk(sample_reference_dir):
+        dirs[:] = [dirname for dirname in dirs if not dirname.startswith(".")]
+        if any(part.startswith(".") for part in Path(root).relative_to(sample_reference_dir).parts):
+            continue
         image_by_stem = {}
         txt_by_stem = {}
         for filename in sorted(files):
+            if filename.startswith("."):
+                continue
             path = os.path.join(root, filename)
             _, ext = os.path.splitext(path)
             stem_name = os.path.splitext(filename)[0]
@@ -616,7 +622,14 @@ def _load_reference_sample_prompts(sample_reference_dir: str) -> list[dict]:
                 ref_paths.append(ref_path)
                 ref_index += 1
 
+            ref_key = tuple(os.path.normcase(os.path.abspath(path)) for path in (ref_paths or [image_path]))
+            prompt_key = (ref_key, prompt)
+            if prompt_key in seen_targets:
+                logger.warning(f"Skipping duplicate Anima sample prompt: {image_path}")
+                continue
+            seen_targets.add(prompt_key)
             prompts.append({"prompt": prompt, "image": ref_paths or image_path})
+    logger.info(f"Loaded {len(prompts)} Anima reference sample prompt(s) from: {sample_reference_dir}")
     return prompts
 
 
@@ -859,6 +872,9 @@ def _sample_image_inference(
     logger.info(
         f"  prompt: {prompt}, size: {width}x{height}, steps: {sample_steps}, scale: {scale}, flow_shift: {flow_shift}, seed: {seed}"
     )
+    sample_ref_paths = _get_sample_reference_paths(prompt_dict)
+    if sample_ref_paths:
+        logger.info(f"  reference image(s): {sample_ref_paths}")
 
     # Encode prompt
     def encode_prompt(prpt):
