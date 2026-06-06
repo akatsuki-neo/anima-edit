@@ -208,7 +208,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--anima_ip_adapter",
         action="store_true",
-        help="Enable Flux-style IP-Adapter conditioning for Anima using the same *_ref reference images.",
+        help="Enable IP-Adapter conditioning for Anima using the same *_ref reference images.",
     )
     parser.add_argument(
         "--anima_ip_adapter_scale",
