@@ -1,16 +1,19 @@
 import argparse
 import datetime
 import gc
+import json
 import math
 from importlib.util import find_spec
 import random
 import os
 import time
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Tuple, Optional, List, Any, Dict, Union
 
 import torch
+import numpy as np
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from tqdm import tqdm
@@ -30,6 +33,77 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class IPAdapterFeatureExtractor:
+    def __init__(self, backend: str, model_dir: Optional[str], device: torch.device, dtype: torch.dtype):
+        self.backend = backend
+        self.model_dir = model_dir
+        self.device = device
+        self.dtype = dtype
+        self.model = None
+        self.transform = None
+        self.feature_dim = None
+        if backend == "ccip":
+            from ccip_lib.ccip import ccip_batch_extract_features, _open_feat_model
+
+            self.extract_fn = ccip_batch_extract_features
+            shape = _open_feat_model(model_dir).get_outputs()[0].shape
+            self.feature_dim = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else None
+        elif backend == "lsnet":
+            self.model, self.transform, self.feature_dim = self._load_lsnet(model_dir, device)
+
+    @staticmethod
+    def _find_lsnet_checkpoint(model_dir):
+        candidates = sorted(Path(model_dir).glob("*.pth")) + sorted(Path(model_dir).glob("*.pt"))
+        if not candidates:
+            raise FileNotFoundError(f"No LSNet checkpoint found in: {model_dir}")
+        return str(candidates[0])
+
+    @staticmethod
+    def _load_lsnet(model_dir, device):
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+        from lsnet_lib.inference_artist import (
+            load_checkpoint_state,
+            load_model,
+            normalize_state_dict_keys,
+            resolve_feature_dim,
+            resolve_num_classes,
+        )
+        from lsnet_lib.lsnet_model.lsnet_artist import default_cfgs_artist
+
+        with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
+            model_name = json.load(f)["model"]
+        checkpoint = IPAdapterFeatureExtractor._find_lsnet_checkpoint(model_dir)
+        state_dict = normalize_state_dict_keys(load_checkpoint_state(checkpoint))
+        feature_dim = resolve_feature_dim(None, state_dict)
+        args = SimpleNamespace(
+            model=model_name,
+            checkpoint=checkpoint,
+            num_classes=resolve_num_classes(None, None, state_dict),
+            feature_dim=feature_dim,
+            mode="cluster",
+            allow_head_reinit=True,
+            device=str(device),
+        )
+        model = load_model(args, state_dict).to(device).eval()
+        input_size = default_cfgs_artist.get(model_name, {}).get("input_size", (3, 448 if model_name.endswith("_448") else 224, 224))[1]
+        transform = create_transform(**resolve_data_config({"input_size": (3, input_size, input_size)}, model=model))
+        return model, transform, feature_dim
+
+    def extract(self, paths):
+        if not paths or self.backend == "vae":
+            return None
+        if self.backend == "ccip":
+            features = self.extract_fn(paths, model=self.model_dir)
+            return torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(self.device, dtype=self.dtype)
+        if self.backend == "lsnet":
+            tensors = [self.transform(Image.open(path).convert("RGB")) for path in paths]
+            with torch.no_grad():
+                features = self.model(torch.stack(tensors).to(self.device), return_features=True)
+            return features.unsqueeze(0).to(dtype=self.dtype)
+        raise ValueError(f"Unsupported IP-Adapter feature backend: {self.backend}")
 
 
 class GenerationSettings:
@@ -75,6 +149,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference_image", type=str, nargs="*", default=None, help="reference image(s) for Anima edit inference")
     parser.add_argument("--reference_max_area", type=int, default=1024 * 1024, help="maximum reference image area before downscale")
     parser.add_argument("--reference_t_offset_scale", type=int, default=10, help="T-coordinate spacing between reference images")
+    parser.add_argument("--no_reference_sequence", action="store_true", help="Do not concatenate reference tokens into the main image sequence")
+    parser.add_argument("--ip_adapter", action="store_true", help="Use reference image(s) through Anima IP-Adapter instead of token concat")
+    parser.add_argument("--ip_adapter_scale", type=float, default=1.0, help="Scale for Anima IP-Adapter conditioning")
+    parser.add_argument("--ip_adapter_weight", type=str, default=None, help="Anima IP-Adapter safetensors weight path")
+    parser.add_argument("--ip_adapter_feature_backend", type=str, default="vae", choices=["vae", "ccip", "lsnet"])
+    parser.add_argument("--ip_adapter_feature_model", type=str, default=None, help="CCIP or LSNet model directory")
+    parser.add_argument("--ip_adapter_feature_dim", type=int, default=None)
+    parser.add_argument("--ip_adapter_num_tokens", type=int, default=4)
     parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 50")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
@@ -303,6 +385,14 @@ def load_dit_model(
     else:
         lora_weights_list = None
 
+    ip_feature_dim = args.ip_adapter_feature_dim
+    if args.ip_adapter and args.ip_adapter_feature_backend != "vae":
+        extractor = IPAdapterFeatureExtractor(args.ip_adapter_feature_backend, args.ip_adapter_feature_model, device, torch.bfloat16)
+        args._ip_adapter_feature_extractor = extractor
+        ip_feature_dim = ip_feature_dim or extractor.feature_dim
+        if ip_feature_dim is None:
+            raise ValueError("Could not infer IP-Adapter feature dim. Please pass --ip_adapter_feature_dim.")
+
     loading_weight_dtype = dit_weight_dtype
     if args.fp8_scaled and not args.lycoris:
         loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
@@ -317,7 +407,17 @@ def load_dit_model(
         args.fp8_scaled and not args.lycoris,
         lora_weights_list=lora_weights_list,
         lora_multipliers=args.lora_multiplier,
+        enable_ip_adapter=args.ip_adapter,
+        ip_adapter_scale=args.ip_adapter_scale,
+        ip_adapter_feature_dim=ip_feature_dim,
+        ip_adapter_num_tokens=args.ip_adapter_num_tokens,
     )
+    if args.ip_adapter_weight is not None:
+        if not args.ip_adapter:
+            raise ValueError("--ip_adapter_weight requires --ip_adapter")
+        logger.info(f"Loading Anima IP-Adapter weight from: {args.ip_adapter_weight}")
+        ip_sd = load_file(args.ip_adapter_weight)
+        model.load_state_dict(ip_sd, strict=False)
     if not args.fp8_scaled:
         # simple cast to dit_weight_dtype
         target_dtype = None  # load as-is (dit_weight_dtype == dtype of the weights in state_dict)
@@ -553,26 +653,50 @@ def generate(
         context, context_null = prepare_text_inputs(args, device, anima, shared_models)
 
     reference_latents = None
+    ip_adapter_embeds = None
     reference_preview_images = []
     if args.reference_image:
-        if shared_models is not None and "vae" in shared_models:
-            vae = shared_models["vae"]
+        if args.ip_adapter and args.ip_adapter_feature_backend != "vae":
+            extractor = getattr(args, "_ip_adapter_feature_extractor", None)
+            if extractor is None:
+                extractor = IPAdapterFeatureExtractor(args.ip_adapter_feature_backend, args.ip_adapter_feature_model, device, torch.bfloat16)
+            ip_adapter_embeds = extractor.extract(args.reference_image)
+            reference_preview_images = [Image.open(path).convert("RGB") for path in args.reference_image]
+            if not args.no_reference_sequence:
+                if shared_models is not None and "vae" in shared_models:
+                    vae = shared_models["vae"]
+                else:
+                    vae = qwen_image_autoencoder_kl.load_vae(
+                        args.vae,
+                        device="cpu",
+                        disable_mmap=True,
+                        spatial_chunk_size=args.vae_chunk_size,
+                        disable_cache=args.vae_disable_cache,
+                    )
+                    vae.to(torch.bfloat16)
+                    vae.eval()
+                    if shared_models is not None:
+                        shared_models["vae"] = vae
+                reference_latents, _ = encode_reference_latents(args, anima, vae, device, torch.bfloat16)
         else:
-            vae = qwen_image_autoencoder_kl.load_vae(
-                args.vae,
-                device="cpu",
-                disable_mmap=True,
-                spatial_chunk_size=args.vae_chunk_size,
-                disable_cache=args.vae_disable_cache,
-            )
-            vae.to(torch.bfloat16)
-            vae.eval()
-            if shared_models is not None:
-                shared_models["vae"] = vae
-        reference_latents, reference_preview_images = encode_reference_latents(args, anima, vae, device, torch.bfloat16)
+            if shared_models is not None and "vae" in shared_models:
+                vae = shared_models["vae"]
+            else:
+                vae = qwen_image_autoencoder_kl.load_vae(
+                    args.vae,
+                    device="cpu",
+                    disable_mmap=True,
+                    spatial_chunk_size=args.vae_chunk_size,
+                    disable_cache=args.vae_disable_cache,
+                )
+                vae.to(torch.bfloat16)
+                vae.eval()
+                if shared_models is not None:
+                    shared_models["vae"] = vae
+            reference_latents, reference_preview_images = encode_reference_latents(args, anima, vae, device, torch.bfloat16)
     args._reference_preview_images = reference_preview_images
 
-    return generate_body(args, anima, context, context_null, device, seed, reference_latents)
+    return generate_body(args, anima, context, context_null, device, seed, reference_latents, ip_adapter_embeds)
 
 
 def generate_body(
@@ -583,6 +707,7 @@ def generate_body(
     device: torch.device,
     seed: int,
     reference_latents: Optional[list[list[torch.Tensor]]] = None,
+    ip_adapter_embeds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     # set random generator
@@ -643,6 +768,10 @@ def generate_body(
                     padding_mask=padding_mask,
                     reference_latents=reference_latents,
                     reference_t_offset_scale=args.reference_t_offset_scale,
+                    ip_adapter_latents=None if ip_adapter_embeds is not None else reference_latents,
+                    ip_adapter_embeds=ip_adapter_embeds,
+                    use_ip_adapter=args.ip_adapter,
+                    use_reference_sequence=not args.no_reference_sequence,
                 )
 
             if do_cfg:
@@ -654,6 +783,10 @@ def generate_body(
                         padding_mask=padding_mask,
                         reference_latents=reference_latents,
                         reference_t_offset_scale=args.reference_t_offset_scale,
+                        ip_adapter_latents=None if ip_adapter_embeds is not None else reference_latents,
+                        ip_adapter_embeds=ip_adapter_embeds,
+                        use_ip_adapter=args.ip_adapter,
+                        use_reference_sequence=not args.no_reference_sequence,
                     )
                 noise_pred = uncond_noise_pred + args.guidance_scale * (noise_pred - uncond_noise_pred)
 
@@ -738,18 +871,24 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
     save_image = image
     reference_preview_images = getattr(args, "_reference_preview_images", [])
     if reference_preview_images:
-        ref_width = sum(ref.width for ref in reference_preview_images)
-        ref_height = max(ref.height for ref in reference_preview_images)
-        ref_canvas = Image.new("RGB", (ref_width, ref_height), (255, 255, 255))
-        x_offset = 0
+        target_height = image.height
+        resized_refs = []
         for ref in reference_preview_images:
-            ref_canvas.paste(ref, (x_offset, (ref_height - ref.height) // 2))
+            ref = ref.convert("RGB")
+            if ref.height != target_height:
+                width = max(1, round(ref.width * target_height / ref.height))
+                ref = ref.resize((width, target_height), Image.Resampling.LANCZOS)
+            resized_refs.append(ref)
+
+        ref_canvas = Image.new("RGB", (sum(ref.width for ref in resized_refs), target_height), (255, 255, 255))
+        x_offset = 0
+        for ref in resized_refs:
+            ref_canvas.paste(ref, (x_offset, 0))
             x_offset += ref.width
 
-        out_height = max(ref_canvas.height, image.height)
-        comparison = Image.new("RGB", (ref_canvas.width + image.width, out_height), (255, 255, 255))
-        comparison.paste(ref_canvas, (0, (out_height - ref_canvas.height) // 2))
-        comparison.paste(image, (ref_canvas.width, (out_height - image.height) // 2))
+        comparison = Image.new("RGB", (ref_canvas.width + image.width, target_height), (255, 255, 255))
+        comparison.paste(ref_canvas, (0, 0))
+        comparison.paste(image.convert("RGB"), (ref_canvas.width, 0))
         save_image = comparison
 
     save_image.save(os.path.join(save_path, f"{image_name}.png"))

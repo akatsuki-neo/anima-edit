@@ -251,7 +251,7 @@ def create_network(
             exclude_patterns = [exclude_patterns]
 
     # add default exclude patterns
-    exclude_patterns.append(r".*(_modulation|_norm|_embedder|final_layer).*")
+    exclude_patterns.append(r".*(_modulation|_norm|_embedder|final_layer|ip_adapter).*")
 
     # regular expression for module selection: exclude and include
     include_patterns = kwargs.get("include_patterns", None)

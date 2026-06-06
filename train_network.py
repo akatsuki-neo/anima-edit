@@ -944,6 +944,9 @@ class NetworkTrainer:
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+            unwrapped_network = accelerator.unwrap_model(network)
+            if hasattr(unwrapped_network, "save_ip_adapter_state"):
+                unwrapped_network.save_ip_adapter_state(output_dir)
 
         steps_from_state = None
 
@@ -965,6 +968,9 @@ class NetworkTrainer:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
+            unwrapped_network = accelerator.unwrap_model(network)
+            if hasattr(unwrapped_network, "load_ip_adapter_state"):
+                unwrapped_network.load_ip_adapter_state(input_dir)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1312,6 +1318,9 @@ class NetworkTrainer:
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
+            unwrapped_network = accelerator.unwrap_model(network)
+            if hasattr(unwrapped_network, "remove_old_ip_checkpoint"):
+                unwrapped_network.remove_old_ip_checkpoint(old_ckpt_file)
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)

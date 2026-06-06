@@ -56,7 +56,7 @@ def detect_arch_config(unet, text_encoders) -> ArchConfig:
             te_target_modules=["Qwen3Attention", "Qwen3MLP", "Qwen3SdpaAttention", "Qwen3FlashAttention2"],
             unet_prefix="lora_unet",
             te_prefixes=["lora_te"],
-            default_excludes=[r".*(_modulation|_norm|_embedder|final_layer).*"],
+            default_excludes=[r".*(_modulation|_norm|_embedder|final_layer|ip_adapter).*"],
             adapter_target_modules=["LLMAdapterTransformerBlock"],
         )
 

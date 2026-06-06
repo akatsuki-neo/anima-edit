@@ -39,6 +39,10 @@ def load_anima_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[list[float]] = None,
+    enable_ip_adapter: bool = False,
+    ip_adapter_scale: float = 1.0,
+    ip_adapter_feature_dim: Optional[int] = None,
+    ip_adapter_num_tokens: int = 4,
 ) -> anima_models.Anima:
     """
     Load Anima model from the specified checkpoint.
@@ -143,6 +147,17 @@ def load_anima_model(
     if unexpected:
         # Raise error to avoid silent failures
         raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    if enable_ip_adapter:
+        model.enable_ip_adapter(
+            ip_adapter_scale,
+            feature_dim=ip_adapter_feature_dim,
+            num_feature_tokens=ip_adapter_num_tokens,
+        )
+        ip_adapter_dtype = dit_weight_dtype
+        for block in model.blocks:
+            if block.ip_adapter is not None:
+                block.ip_adapter.to(device=loading_device, dtype=ip_adapter_dtype)
     logger.info(f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
     return model

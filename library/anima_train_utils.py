@@ -2,9 +2,12 @@
 
 import argparse
 import gc
+import json
 import math
 import os
+from pathlib import Path
 import time
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -24,6 +27,67 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class AnimaSampleIPFeatureExtractor:
+    def __init__(self, backend: str, model_dir: str, device: torch.device, dtype: torch.dtype):
+        self.backend = backend
+        self.model_dir = model_dir
+        self.device = device
+        self.dtype = dtype
+        self.feature_dim = None
+        if backend == "ccip":
+            from ccip_lib.ccip import ccip_batch_extract_features, _open_feat_model
+
+            self.extract_fn = ccip_batch_extract_features
+            shape = _open_feat_model(model_dir).get_outputs()[0].shape
+            self.feature_dim = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else None
+        elif backend == "lsnet":
+            self.model, self.transform, self.feature_dim = self._load_lsnet(model_dir, device)
+
+    @staticmethod
+    def _find_lsnet_checkpoint(model_dir):
+        candidates = sorted(Path(model_dir).glob("*.pth")) + sorted(Path(model_dir).glob("*.pt"))
+        if not candidates:
+            raise FileNotFoundError(f"No LSNet checkpoint found in: {model_dir}")
+        return str(candidates[0])
+
+    @staticmethod
+    def _load_lsnet(model_dir, device):
+        from timm.data import resolve_data_config
+        from timm.data.transforms_factory import create_transform
+        from lsnet_lib.inference_artist import load_checkpoint_state, load_model, normalize_state_dict_keys, resolve_feature_dim, resolve_num_classes
+        from lsnet_lib.lsnet_model.lsnet_artist import default_cfgs_artist
+
+        with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
+            model_name = json.load(f)["model"]
+        checkpoint = AnimaSampleIPFeatureExtractor._find_lsnet_checkpoint(model_dir)
+        state_dict = normalize_state_dict_keys(load_checkpoint_state(checkpoint))
+        feature_dim = resolve_feature_dim(None, state_dict)
+        load_args = SimpleNamespace(
+            model=model_name,
+            checkpoint=checkpoint,
+            num_classes=resolve_num_classes(None, None, state_dict),
+            feature_dim=feature_dim,
+            mode="cluster",
+            allow_head_reinit=True,
+            device=str(device),
+        )
+        model = load_model(load_args, state_dict).to(device).eval()
+        input_size = default_cfgs_artist.get(model_name, {}).get("input_size", (3, 448 if model_name.endswith("_448") else 224, 224))[1]
+        transform = create_transform(**resolve_data_config({"input_size": (3, input_size, input_size)}, model=model))
+        return model, transform, feature_dim
+
+    def extract(self, image_paths):
+        if self.backend == "ccip":
+            features = self.extract_fn(image_paths, model=self.model_dir)
+            return torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(self.device, dtype=self.dtype)
+        if self.backend == "lsnet":
+            tensors = [self.transform(Image.open(path).convert("RGB")) for path in image_paths]
+            with torch.no_grad():
+                features = self.model(torch.stack(tensors).to(self.device), return_features=True)
+            return features.unsqueeze(0).to(dtype=self.dtype)
+        return None
 
 
 # Anima-specific training arguments
@@ -141,6 +205,64 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Enable Flux2 Klein-style multi-image reference conditioning for Anima training.",
     )
     parser.add_argument(
+        "--anima_ip_adapter",
+        action="store_true",
+        help="Enable Flux-style IP-Adapter conditioning for Anima using the same *_ref reference images.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_scale",
+        type=float,
+        default=1.0,
+        help="Scale for the Anima IP-Adapter K/V attention branch.",
+    )
+    parser.add_argument(
+        "--anima_train_ip_adapter",
+        action="store_true",
+        help="Train and save Anima IP-Adapter weights separately from LoRA/LyCORIS weights.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_lr",
+        type=float,
+        default=None,
+        help="Learning rate for Anima IP-Adapter parameters. Defaults to unet_lr or learning_rate.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_weights",
+        type=str,
+        default=None,
+        help="Optional Anima IP-Adapter safetensors weights to load before training.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_feature_backend",
+        type=str,
+        default="vae",
+        choices=["vae", "ccip", "lsnet"],
+        help="Feature extractor for Anima IP-Adapter references. 'vae' reuses reference latent tokens.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_feature_model",
+        type=str,
+        default=None,
+        help="Model directory for CCIP or LSNet IP-Adapter feature extraction.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_feature_dim",
+        type=int,
+        default=None,
+        help="Override IP-Adapter feature dimension if it cannot be inferred automatically.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_num_tokens",
+        type=int,
+        default=4,
+        help="Number of learned Anima tokens projected from each CCIP/LSNet feature vector.",
+    )
+    parser.add_argument(
+        "--anima_disable_network_training",
+        action="store_true",
+        help="Do not train LoRA/LyCORIS network parameters; useful for IP-Adapter-only training.",
+    )
+    parser.add_argument(
         "--anima_reference_t_offset_scale",
         type=int,
         default=10,
@@ -149,7 +271,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--anima_reference_max_area",
         type=int,
-        default=2048 * 2048,
+        default=1024 * 1024,
         help="Maximum reference image area before aspect-preserving downscale. Set 0 to disable.",
     )
     parser.add_argument(
@@ -343,6 +465,9 @@ def do_sample(
     neg_crossattn_emb: Optional[torch.Tensor] = None,
     reference_latents: Optional[list[list[torch.Tensor]]] = None,
     reference_t_offset_scale: int = 10,
+    use_ip_adapter: bool = False,
+    use_reference_sequence: bool = True,
+    ip_adapter_embeds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Generate a sample using Euler discrete sampling for rectified flow.
 
@@ -400,6 +525,10 @@ def do_sample(
                 padding_mask=padding_mask,
                 reference_latents=reference_latents,
                 reference_t_offset_scale=reference_t_offset_scale,
+                ip_adapter_latents=None if ip_adapter_embeds is not None else reference_latents,
+                ip_adapter_embeds=ip_adapter_embeds,
+                use_ip_adapter=use_ip_adapter,
+                use_reference_sequence=use_reference_sequence,
             )
             pos_out = pos_out.float()
             neg_out = dit(
@@ -409,6 +538,10 @@ def do_sample(
                 padding_mask=padding_mask,
                 reference_latents=reference_latents,
                 reference_t_offset_scale=reference_t_offset_scale,
+                ip_adapter_latents=None if ip_adapter_embeds is not None else reference_latents,
+                ip_adapter_embeds=ip_adapter_embeds,
+                use_ip_adapter=use_ip_adapter,
+                use_reference_sequence=use_reference_sequence,
             )
             neg_out = neg_out.float()
 
@@ -421,6 +554,10 @@ def do_sample(
                 padding_mask=padding_mask,
                 reference_latents=reference_latents,
                 reference_t_offset_scale=reference_t_offset_scale,
+                ip_adapter_latents=None if ip_adapter_embeds is not None else reference_latents,
+                ip_adapter_embeds=ip_adapter_embeds,
+                use_ip_adapter=use_ip_adapter,
+                use_reference_sequence=use_reference_sequence,
             )
             model_output = model_output.float()
 
@@ -494,6 +631,58 @@ def _encode_sample_reference_images(prompt_dict, args, dit, vae, device, dtype):
     finally:
         vae.to(org_vae_device)
     return [refs], preview_images
+
+
+def _get_sample_reference_paths(prompt_dict):
+    image_paths = prompt_dict.get("image") or prompt_dict.get("reference_image") or prompt_dict.get("reference_images")
+    if image_paths is None:
+        return []
+    if isinstance(image_paths, str):
+        return [image_paths]
+    return list(image_paths)
+
+
+def _encode_sample_ip_adapter_embeds(prompt_dict, args, device, dtype):
+    if not getattr(args, "anima_ip_adapter", False) or args.anima_ip_adapter_feature_backend == "vae":
+        return None
+    image_paths = _get_sample_reference_paths(prompt_dict)
+    if not image_paths:
+        return None
+    extractor = getattr(args, "_anima_sample_ip_feature_extractor", None)
+    if extractor is None:
+        extractor = AnimaSampleIPFeatureExtractor(
+            args.anima_ip_adapter_feature_backend,
+            args.anima_ip_adapter_feature_model,
+            device,
+            dtype,
+        )
+        args._anima_sample_ip_feature_extractor = extractor
+    return extractor.extract(image_paths)
+
+
+def _make_reference_comparison(reference_images: list[Image.Image], output_image: Image.Image) -> Image.Image:
+    if not reference_images:
+        return output_image
+
+    target_height = output_image.height
+    resized_refs = []
+    for ref in reference_images:
+        ref = ref.convert("RGB")
+        if ref.height != target_height:
+            width = max(1, round(ref.width * target_height / ref.height))
+            ref = ref.resize((width, target_height), Image.Resampling.LANCZOS)
+        resized_refs.append(ref)
+
+    ref_canvas = Image.new("RGB", (sum(ref.width for ref in resized_refs), target_height), (255, 255, 255))
+    x_offset = 0
+    for ref in resized_refs:
+        ref_canvas.paste(ref, (x_offset, 0))
+        x_offset += ref.width
+
+    comparison = Image.new("RGB", (ref_canvas.width + output_image.width, target_height), (255, 255, 255))
+    comparison.paste(ref_canvas, (0, 0))
+    comparison.paste(output_image.convert("RGB"), (ref_canvas.width, 0))
+    return comparison
 
 
 def sample_images(
@@ -711,9 +900,18 @@ def _sample_image_inference(
 
     # Generate sample
     clean_memory_on_device(accelerator.device)
-    reference_latents, reference_preview_images = _encode_sample_reference_images(
-        prompt_dict, args, dit, vae, accelerator.device, dit.dtype
+    ip_adapter_embeds = _encode_sample_ip_adapter_embeds(prompt_dict, args, accelerator.device, dit.dtype)
+    reference_latents, reference_preview_images = None, []
+    needs_reference_latents = (
+        getattr(args, "anima_use_reference_sequence", args.anima_multi_image_edit)
+        or (getattr(args, "anima_ip_adapter", False) and args.anima_ip_adapter_feature_backend == "vae")
     )
+    if needs_reference_latents:
+        reference_latents, reference_preview_images = _encode_sample_reference_images(
+            prompt_dict, args, dit, vae, accelerator.device, dit.dtype
+        )
+    else:
+        reference_preview_images = [Image.open(path).convert("RGB") for path in _get_sample_reference_paths(prompt_dict)]
     latents = do_sample(
         height,
         width,
@@ -728,6 +926,9 @@ def _sample_image_inference(
         neg_crossattn_emb,
         reference_latents=reference_latents,
         reference_t_offset_scale=args.anima_reference_t_offset_scale,
+        use_ip_adapter=args.anima_ip_adapter,
+        use_reference_sequence=getattr(args, "anima_use_reference_sequence", args.anima_multi_image_edit),
+        ip_adapter_embeds=ip_adapter_embeds,
     )
 
     # Decode latents
@@ -750,20 +951,7 @@ def _sample_image_inference(
     decoded_np = decoded_np.astype(np.uint8)
 
     image = Image.fromarray(decoded_np)
-    save_image = image
-    if reference_preview_images:
-        ref_width = sum(ref.width for ref in reference_preview_images)
-        ref_height = max(ref.height for ref in reference_preview_images)
-        ref_canvas = Image.new("RGB", (ref_width, ref_height), (255, 255, 255))
-        x_offset = 0
-        for ref in reference_preview_images:
-            ref_canvas.paste(ref, (x_offset, (ref_height - ref.height) // 2))
-            x_offset += ref.width
-        out_height = max(ref_canvas.height, image.height)
-        comparison = Image.new("RGB", (ref_canvas.width + image.width, out_height), (255, 255, 255))
-        comparison.paste(ref_canvas, (0, (out_height - ref_canvas.height) // 2))
-        comparison.paste(image, (ref_canvas.width, (out_height - image.height) // 2))
-        save_image = comparison
+    save_image = _make_reference_comparison(reference_preview_images, image)
 
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
