@@ -34,3 +34,4 @@ accelerate launch anima_train_network.py \
   --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model \
   --anima_ip_adapter_num_tokens 8 \
   --save_every_n_steps 500 \
+  --linear-adapter

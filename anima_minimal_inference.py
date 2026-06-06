@@ -157,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ip_adapter_feature_model", type=str, default=None, help="CCIP or LSNet model directory")
     parser.add_argument("--ip_adapter_feature_dim", type=int, default=None)
     parser.add_argument("--ip_adapter_num_tokens", type=int, default=4)
+    parser.add_argument("--linear-adapter", "--ip_adapter_linear_adapter", dest="linear_adapter", action="store_true")
     parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 50")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
@@ -411,6 +412,7 @@ def load_dit_model(
         ip_adapter_scale=args.ip_adapter_scale,
         ip_adapter_feature_dim=ip_feature_dim,
         ip_adapter_num_tokens=args.ip_adapter_num_tokens,
+        ip_adapter_linear_adapter=getattr(args, "linear_adapter", False),
     )
     if args.ip_adapter_weight is not None:
         if not args.ip_adapter:
