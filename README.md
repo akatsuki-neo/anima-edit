@@ -5,7 +5,7 @@ See the upstream sd-scripts documentation for the common training options.
 Anima edit options:
 
 ```bash
-# Flux2 Klein-style multi-image reference token concat
+# multi-image reference token concat
 --anima_multi_image_edit
 
 # Enable the Anima IP-Adapter path. This does not enable token concat by itself.
