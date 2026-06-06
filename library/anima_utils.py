@@ -155,9 +155,8 @@ def load_anima_model(
             num_feature_tokens=ip_adapter_num_tokens,
         )
         ip_adapter_dtype = dit_weight_dtype
-        for block in model.blocks:
-            if block.ip_adapter is not None:
-                block.ip_adapter.to(device=loading_device, dtype=ip_adapter_dtype)
+        if model.visual_condition_adapter is not None:
+            model.visual_condition_adapter.to(device=loading_device, dtype=ip_adapter_dtype)
     logger.info(f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
     return model

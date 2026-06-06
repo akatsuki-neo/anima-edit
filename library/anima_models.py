@@ -373,74 +373,77 @@ class Attention(nn.Module):
         return self.output_dropout(self.output_proj(result))
 
 
-class AnimaIPAdapter(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4):
+class AnimaVisualConditionAdapter(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_size: int,
+        num_heads: int,
+        num_feature_tokens: int = 4,
+        num_layers: int = 3,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.scale = scale
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"Visual condition hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads}).")
         self.feature_dim = feature_dim
+        self.hidden_size = hidden_size
         self.num_feature_tokens = num_feature_tokens
-        self.feature_proj = (
-            nn.Sequential(
-                nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True),
-                nn.LayerNorm(hidden_size * num_feature_tokens),
-            )
-            if feature_dim is not None
-            else None
+        self.feature_norm = RMSNorm(feature_dim, eps=1e-6)
+        self.source_proj = nn.Linear(feature_dim, hidden_size, bias=True)
+        self.visual_queries = nn.Parameter(torch.empty(num_feature_tokens, hidden_size))
+        self.refiner = nn.ModuleList(
+            [
+                LLMAdapterTransformerBlock(
+                    source_dim=hidden_size,
+                    model_dim=hidden_size,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    self_attn=True,
+                    layer_norm=False,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.to_k_ip = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_v_ip = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-        self.v_norm = nn.Identity()
+        self.out_norm = LLMAdapterRMSNorm(hidden_size)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        std = 1.0 / math.sqrt(self.hidden_size)
-        if self.feature_proj is not None:
-            feature_std = 1.0 / math.sqrt(self.feature_dim)
-            torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
-            torch.nn.init.zeros_(self.feature_proj[0].bias)
-        torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.zeros_(self.to_v_ip.weight)
-        if hasattr(self.k_norm, "reset_parameters"):
-            self.k_norm.reset_parameters()
-
-    def project_features(self, features: torch.Tensor) -> torch.Tensor:
-        if self.feature_proj is None:
-            raise ValueError("This AnimaIPAdapter was not initialized with feature_dim.")
-        if features.ndim == 2:
-            features = features.unsqueeze(1)
-        batch, num_refs, dim = features.shape
-        tokens = self.feature_proj(features.reshape(batch * num_refs, dim))
-        tokens = tokens.reshape(batch, num_refs * self.num_feature_tokens, self.hidden_size)
-        return tokens
+        self.feature_norm.reset_parameters()
+        std = 1.0 / math.sqrt(self.feature_dim)
+        torch.nn.init.trunc_normal_(self.source_proj.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.source_proj.bias)
+        query_std = 1.0 / math.sqrt(self.hidden_size)
+        torch.nn.init.trunc_normal_(self.visual_queries, std=query_std, a=-3 * query_std, b=3 * query_std)
+        for layer in self.refiner:
+            layer.init_weights()
+        self.out_norm.weight.data.fill_(1.0)
 
     def forward(
         self,
-        query: torch.Tensor,
-        reference_tokens: torch.Tensor,
+        features: torch.Tensor,
         attn_params: attention.AttentionParams,
-        query_len: Optional[int] = None,
+        rope_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if reference_tokens is None or reference_tokens.shape[1] == 0 or self.scale == 0:
-            q = query[:, :query_len] if query_len is not None else query
-            return torch.zeros((q.shape[0], q.shape[1], self.hidden_size), dtype=q.dtype, device=q.device)
+        del attn_params, rope_emb
+        if features.ndim == 2:
+            features = features.unsqueeze(1)
+        elif features.ndim == 4:
+            batch, height, width, dim = features.shape
+            features = features.reshape(batch, height * width, dim)
+        elif features.ndim == 5:
+            batch, num_refs, height, width, dim = features.shape
+            features = features.reshape(batch, num_refs * height * width, dim)
 
-        q = query[:, :query_len] if query_len is not None else query
-        k = rearrange(self.to_k_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
-        v = rearrange(self.to_v_ip(reference_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
+        batch, num_features, _ = features.shape
+        if num_features == 0:
+            return features.new_zeros((batch, 0, self.hidden_size))
 
-        if q.dtype != v.dtype:
-            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
-
-        result = attention.attention([q, k, v], attn_params=attn_params)
-        return result.to(query.dtype) * self.scale
+        source = self.source_proj(self.feature_norm(features))
+        tokens = self.visual_queries.unsqueeze(0).expand(batch, -1, -1).to(dtype=source.dtype, device=source.device)
+        for layer in self.refiner:
+            tokens = layer(tokens, source)
+        return self.out_norm(tokens)
 
 
 # Positional Embeddings
@@ -900,7 +903,6 @@ class Block(nn.Module):
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
-        self.ip_adapter: Optional[AnimaIPAdapter] = None
 
         self.use_adaln_lora = use_adaln_lora
         if self.use_adaln_lora:
@@ -961,24 +963,12 @@ class Block(nn.Module):
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
         self.mlp.init_weights()
-        if self.ip_adapter is not None:
-            self.ip_adapter.reset_parameters()
 
     def enable_ip_adapter(self, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4) -> None:
-        if self.ip_adapter is None:
-            self.ip_adapter = AnimaIPAdapter(
-                self.x_dim,
-                self.self_attn.n_heads,
-                scale=scale,
-                feature_dim=feature_dim,
-                num_feature_tokens=num_feature_tokens,
-            )
-        else:
-            self.ip_adapter.scale = scale
+        del scale, feature_dim, num_feature_tokens
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        if self.ip_adapter is not None:
-            self.ip_adapter.scale = scale
+        del scale
 
     def _forward(
         self,
@@ -1114,16 +1104,6 @@ class Block(nn.Module):
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_self_attn, scale_self, shift_self)
         result = self.self_attn(normalized_x, attn_params, None, rope_emb=rope_emb_L_1_1_D)
-        if self.ip_adapter is not None and ip_adapter_tokens is not None:
-            ip_query = self.self_attn.q_proj(normalized_x)
-            ip_query = rearrange(ip_query, "b l (h d) -> b l h d", h=self.self_attn.n_heads, d=self.self_attn.head_dim)
-            ip_query = self.self_attn.q_norm(ip_query)
-            ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
-            if ip_adapter_query_len is None or ip_adapter_query_len == result.shape[1]:
-                result = result + ip_result
-            else:
-                result = result.clone()
-                result[:, :ip_adapter_query_len] = result[:, :ip_adapter_query_len] + ip_result
         x_B_L_D = x_B_L_D + expand_param(gate_self) * result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
@@ -1345,6 +1325,7 @@ class Anima(nn.Module):
         self.num_heads = num_heads
         self.num_blocks = num_blocks
         self.model_channels = model_channels
+        self.crossattn_emb_channels = crossattn_emb_channels
         self.concat_padding_mask = concat_padding_mask
         self.pos_emb_cls = pos_emb_cls
         self.pos_emb_learnable = pos_emb_learnable
@@ -1370,6 +1351,7 @@ class Anima(nn.Module):
 
         self.build_patch_embed()
         self.build_pos_embed()
+        self.visual_condition_adapter: Optional[AnimaVisualConditionAdapter] = None
         self.use_adaln_lora = use_adaln_lora
         self.adaln_lora_dim = adaln_lora_dim
         self.t_embedder = nn.Sequential(
@@ -1535,17 +1517,25 @@ class Anima(nn.Module):
         return rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d"), ids, (T, H, W)
 
     def enable_ip_adapter(self, scale: float = 1.0, feature_dim: Optional[int] = None, num_feature_tokens: int = 4) -> None:
-        for block in self.blocks:
-            block.enable_ip_adapter(scale, feature_dim=feature_dim, num_feature_tokens=num_feature_tokens)
+        del scale
+        if feature_dim is None:
+            return
+        if self.visual_condition_adapter is None:
+            self.visual_condition_adapter = AnimaVisualConditionAdapter(
+                feature_dim=feature_dim,
+                hidden_size=self.crossattn_emb_channels,
+                num_heads=self.num_heads,
+                num_feature_tokens=num_feature_tokens,
+            )
 
     def project_ip_adapter_features(self, features: torch.Tensor) -> torch.Tensor:
-        if not self.blocks or self.blocks[0].ip_adapter is None:
+        if self.visual_condition_adapter is None:
             raise ValueError("IP-Adapter is not enabled.")
-        return self.blocks[0].ip_adapter.project_features(features)
+        attn_params = attention.AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
+        return self.visual_condition_adapter(features, attn_params)
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        for block in self.blocks:
-            block.set_ip_adapter_scale(scale)
+        del scale
 
     def _prepare_reference_flat_tokens(
         self,
@@ -1737,29 +1727,34 @@ class Anima(nn.Module):
                     ref_tokens.append(tokens)
                     ref_ids.append(ids)
 
+                visual_context_tokens = []
+                visual_latent_tokens = []
+                visual_latent_ids = []
                 if ip_adapter_embeds is not None:
                     if isinstance(ip_adapter_embeds, list):
                         sample_embeds = ip_adapter_embeds[batch_index].unsqueeze(0)
                     else:
                         sample_embeds = ip_adapter_embeds[batch_index : batch_index + 1]
-                    ip_tokens = self.project_ip_adapter_features(sample_embeds.to(x_i.device, x_i.dtype))
+                    tokens = self.project_ip_adapter_features(sample_embeds.to(x_i.device, x_i.dtype))
+                    visual_context_tokens.append(tokens)
                 else:
-                    ip_tokens = []
                     for ref_index, ref_latent in enumerate((ip_adapter_latents[batch_index] if ip_adapter_latents is not None else []) or []):
                         if ref_latent.ndim == 4:
                             ref_latent = ref_latent.unsqueeze(2)
                         ref_latent = ref_latent.to(device=x_i.device, dtype=x_i.dtype)
-                        tokens, _, _ = self._prepare_flat_tokens(
+                        tokens, ids, _ = self._prepare_flat_tokens(
                             ref_latent,
                             t_offset=reference_t_offset_scale * (ref_index + 1),
                             padding_mask=None,
                         )
-                        ip_tokens.append(tokens)
-                    ip_tokens = torch.cat(ip_tokens, dim=1) if ip_tokens else None
+                        visual_latent_tokens.append(tokens)
+                        visual_latent_ids.append(ids)
 
-                if ref_tokens:
-                    x_tokens = torch.cat([target_tokens] + ref_tokens, dim=1)
-                    ids = torch.cat([target_ids] + ref_ids, dim=0)
+                extra_tokens = ref_tokens + visual_latent_tokens
+                extra_ids = ref_ids + visual_latent_ids
+                if extra_tokens:
+                    x_tokens = torch.cat([target_tokens] + extra_tokens, dim=1)
+                    ids = torch.cat([target_ids] + extra_ids, dim=0)
                 else:
                     x_tokens = target_tokens
                     ids = target_ids
@@ -1769,6 +1764,8 @@ class Anima(nn.Module):
                 t_embedding, adaln_lora = self.t_embedder(timestep_i)
                 t_embedding = self.t_embedding_norm(t_embedding)
                 context_i = crossattn_emb[batch_index : batch_index + 1]
+                if visual_context_tokens:
+                    context_i = torch.cat([context_i] + visual_context_tokens, dim=1)
                 use_fp32 = x_tokens.dtype == torch.float16
 
                 for block_idx, block in enumerate(self.blocks):
@@ -1782,8 +1779,8 @@ class Anima(nn.Module):
                         use_fp32,
                         rope_emb,
                         adaln_lora,
-                        ip_adapter_tokens=ip_tokens,
-                        ip_adapter_query_len=target_tokens.shape[1] if use_ip_adapter else None,
+                        ip_adapter_tokens=None,
+                        ip_adapter_query_len=None,
                     )
                     if self.blocks_to_swap:
                         self.offloader.submit_move_blocks(self.blocks, block_idx)

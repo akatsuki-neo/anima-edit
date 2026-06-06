@@ -372,7 +372,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     @staticmethod
     def is_ip_adapter_parameter_name(name: str) -> bool:
-        return ".ip_adapter." in name or name.startswith("ip_adapter_feature_")
+        return name.startswith("visual_condition_adapter.")
 
     @staticmethod
     def get_ip_adapter_parameters(unet):
