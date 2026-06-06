@@ -401,7 +401,7 @@ class AnimaIPAdapter(nn.Module):
             torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=feature_std, a=-3 * feature_std, b=3 * feature_std)
             torch.nn.init.zeros_(self.feature_proj[0].bias)
         torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.to_v_ip.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.zeros_(self.to_v_ip.weight)
         torch.nn.init.zeros_(self.to_k_ip.bias)
         torch.nn.init.zeros_(self.to_v_ip.bias)
 
