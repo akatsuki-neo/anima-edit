@@ -1455,7 +1455,10 @@ class NetworkTrainer:
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            if hasattr(self, "get_params_to_clip"):
+                                params_to_clip = self.get_params_to_clip(accelerator, network)
+                            else:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         if hasattr(network, "update_grad_norms"):

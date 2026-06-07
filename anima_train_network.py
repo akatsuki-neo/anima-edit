@@ -644,6 +644,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if unet is not None:
             self._last_ip_adapter_grad_norm = self.get_ip_adapter_norms(unet)["grad_norm"]
 
+    def get_params_to_clip(self, accelerator, network):
+        params = list(accelerator.unwrap_model(network).get_trainable_params())
+        unet = getattr(self, "_current_unet_for_logging", None)
+        if unet is not None:
+            params.extend(self.get_ip_adapter_parameters(unet))
+        return params
+
     def generate_step_logs(
         self,
         args,
@@ -675,7 +682,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if getattr(args, "anima_ip_adapter", False) and unet is not None:
             norms = self.get_ip_adapter_norms(unet)
             logs["anima_ip_adapter/param_norm"] = norms["param_norm"]
-            grad_norm = getattr(self, "_last_ip_adapter_grad_norm", norms["grad_norm"])
+            grad_norm = norms["grad_norm"]
+            if grad_norm is None:
+                grad_norm = getattr(self, "_last_ip_adapter_grad_norm", None)
             if grad_norm is not None:
                 logs["anima_ip_adapter/grad_norm"] = grad_norm
         return logs
