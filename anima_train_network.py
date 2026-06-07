@@ -644,6 +644,12 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if unet is not None:
             self._last_ip_adapter_grad_norm = self.get_ip_adapter_norms(unet)["grad_norm"]
 
+    def on_after_gradient_clip(self, accelerator, network):
+        del accelerator, network
+        unet = getattr(self, "_current_unet_for_logging", None)
+        if unet is not None:
+            self._last_ip_adapter_grad_norm = self.get_ip_adapter_norms(unet)["grad_norm"]
+
     def get_params_to_clip(self, accelerator, network):
         params = list(accelerator.unwrap_model(network).get_trainable_params())
         unet = getattr(self, "_current_unet_for_logging", None)

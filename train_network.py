@@ -1460,6 +1460,8 @@ class NetworkTrainer:
                             else:
                                 params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        if hasattr(self, "on_after_gradient_clip"):
+                            self.on_after_gradient_clip(accelerator, network)
 
                         if hasattr(network, "update_grad_norms"):
                             network.update_grad_norms()
