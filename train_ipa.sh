@@ -28,10 +28,10 @@ accelerate launch anima_train_network.py \
   --logging_dir logs \
   --log_tracker_name anima-edit \
   --wandb_run_name anima_ipadapter_self_ref_overfit \
-  --sample_every_n_steps 100 \
+  --sample_every_n_steps 500 \
   --anima_sample_reference_dir /root/autodl-tmp/ckn/test \
-  --anima_ip_adapter_feature_backend ccip \
-  --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model \
-  --anima_ip_adapter_num_tokens 8 \
-  --save_every_n_steps 500 \
-  --linear-adapter
+  --anima_ip_adapter_feature_backend ccip_tokens \
+  --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model/ccip-caformer_b36-24.ckpt \
+  --anima_ip_adapter_lr 1e-4 \
+  --save_every_n_steps 2000 \
+  --omni-adapter

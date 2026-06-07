@@ -1,19 +1,23 @@
 import argparse
 import datetime
+import importlib.util
 import gc
 import json
 import math
 from importlib.util import find_spec
 import random
 import os
+import sys
 import time
 import copy
 from pathlib import Path
 from types import SimpleNamespace
+import types
 from typing import Tuple, Optional, List, Any, Dict, Union
 
 import torch
 import numpy as np
+from torchvision import transforms
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from tqdm import tqdm
@@ -50,8 +54,87 @@ class IPAdapterFeatureExtractor:
             self.extract_fn = ccip_batch_extract_features
             shape = _open_feat_model(model_dir).get_outputs()[0].shape
             self.feature_dim = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else None
+        elif backend == "ccip_tokens":
+            self.model, self.transform, self.feature_dim = self._load_ccip_tokens(model_dir, device)
         elif backend == "lsnet":
             self.model, self.transform, self.feature_dim = self._load_lsnet(model_dir, device)
+
+    @staticmethod
+    def _find_ccip_checkpoint(model_path):
+        path = Path(model_path)
+        if path.is_file():
+            return str(path)
+        candidates = sorted(path.glob("*.ckpt")) + sorted(path.glob("*.pth")) + sorted(path.glob("*.pt"))
+        if not candidates:
+            raise FileNotFoundError(f"No CCIP checkpoint found in: {model_path}")
+        return str(candidates[0])
+
+    @staticmethod
+    def _clean_ccip_state_dict(state_dict):
+        return {
+            key.removeprefix("module._orig_mod.").removeprefix("module.").removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+
+    @staticmethod
+    def _load_ccip_tokens(model_path, device):
+        imgutils_root = Path(__file__).resolve().parent / "imgutils"
+        IPAdapterFeatureExtractor._prepare_imgutils_modules(imgutils_root)
+        from zoo.ccip.caformer import get_caformer
+
+        checkpoint = IPAdapterFeatureExtractor._find_ccip_checkpoint(model_path)
+        logger.info(f"Loading CCIP token backbone from: {checkpoint}")
+        state_dict = torch.load(checkpoint, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        state_dict = IPAdapterFeatureExtractor._clean_ccip_state_dict(state_dict)
+        first_conv = state_dict.get("feature.backbone.caformer.downsample_layers.0.conv.weight")
+        arch = "caformer_b36_384_in21ft1k" if first_conv is not None and first_conv.shape[0] == 128 else "caformer_s36_384_in21ft1k"
+        logger.info(f"Detected CCIP token backbone arch: {arch}")
+        backbone, transform = get_caformer(arch=arch, pretrained=False)
+        backbone_state = {
+            key.removeprefix("feature.backbone."): value
+            for key, value in state_dict.items()
+            if key.startswith("feature.backbone.")
+        }
+        backbone.load_state_dict(backbone_state, strict=False)
+        backbone.to(device).eval()
+        logger.info(f"Loaded CCIP token backbone. feature_dim={backbone.caformer.output_dim}")
+        return backbone, transform, backbone.caformer.output_dim
+
+    @staticmethod
+    def _prepare_imgutils_modules(imgutils_root: Path) -> None:
+        try:
+            import timm.layers.helpers as timm_layer_helpers
+
+            sys.modules.setdefault("timm.models.layers.helpers", timm_layer_helpers)
+        except Exception:
+            pass
+
+        def ensure_package(name: str, path: Path) -> None:
+            module = sys.modules.get(name)
+            if module is None:
+                module = types.ModuleType(name)
+                module.__path__ = [str(path)]
+                sys.modules[name] = module
+
+        def load_module(name: str, path: Path) -> None:
+            if name in sys.modules:
+                return
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load {name} from {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+
+        ensure_package("zoo", imgutils_root / "zoo")
+        ensure_package("zoo.ccip", imgutils_root / "zoo" / "ccip")
+        ensure_package("zoo.monochrome", imgutils_root / "zoo" / "monochrome")
+        load_module("zoo.monochrome.metaformer_timm", imgutils_root / "zoo" / "monochrome" / "metaformer_timm.py")
+        load_module("zoo.monochrome.metaformer", imgutils_root / "zoo" / "monochrome" / "metaformer.py")
+        load_module("zoo.ccip.attention_pool", imgutils_root / "zoo" / "ccip" / "attention_pool.py")
+        load_module("zoo.ccip.caformer", imgutils_root / "zoo" / "ccip" / "caformer.py")
 
     @staticmethod
     def _find_lsnet_checkpoint(model_dir):
@@ -98,6 +181,19 @@ class IPAdapterFeatureExtractor:
         if self.backend == "ccip":
             features = self.extract_fn(paths, model=self.model_dir)
             return torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(self.device, dtype=self.dtype)
+        if self.backend == "ccip_tokens":
+            tensors = []
+            for path in paths:
+                image = Image.open(path).convert("RGB").resize((384, 384), resample=Image.BILINEAR)
+                tensor = transforms.ToTensor()(image)
+                for transform in self.transform:
+                    tensor = transform(tensor)
+                tensors.append(tensor)
+            batch = torch.stack(tensors).to(self.device)
+            with torch.no_grad():
+                fmap = self.model._get_cnn_result(batch)
+                features = fmap.flatten(2).transpose(1, 2).contiguous()
+            return features.reshape(1, -1, features.shape[-1]).to(dtype=self.dtype)
         if self.backend == "lsnet":
             tensors = [self.transform(Image.open(path).convert("RGB")) for path in paths]
             with torch.no_grad():
@@ -153,11 +249,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ip_adapter", action="store_true", help="Use reference image(s) through Anima IP-Adapter instead of token concat")
     parser.add_argument("--ip_adapter_scale", type=float, default=1.0, help="Scale for Anima IP-Adapter conditioning")
     parser.add_argument("--ip_adapter_weight", type=str, default=None, help="Anima IP-Adapter safetensors weight path")
-    parser.add_argument("--ip_adapter_feature_backend", type=str, default="vae", choices=["vae", "ccip", "lsnet"])
-    parser.add_argument("--ip_adapter_feature_model", type=str, default=None, help="CCIP or LSNet model directory")
+    parser.add_argument("--ip_adapter_feature_backend", type=str, default="vae", choices=["vae", "ccip", "ccip_tokens", "lsnet"])
+    parser.add_argument("--ip_adapter_feature_model", type=str, default=None, help="CCIP, CCIP token, or LSNet model directory/checkpoint")
     parser.add_argument("--ip_adapter_feature_dim", type=int, default=None)
     parser.add_argument("--ip_adapter_num_tokens", type=int, default=4)
     parser.add_argument("--linear-adapter", "--ip_adapter_linear_adapter", dest="linear_adapter", action="store_true")
+    parser.add_argument("--mlp-adapter", "--mlp_adapter", "--ip_adapter_mlp_adapter", dest="mlp_adapter", action="store_true")
+    parser.add_argument(
+        "--norm-linear-adapter",
+        "--norm_linear_adapter",
+        "--ip_adapter_norm_linear_adapter",
+        dest="norm_linear_adapter",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--omni-adapter",
+        "--omni_adapter",
+        "--ip_adapter_omni_adapter",
+        dest="omni_adapter",
+        action="store_true",
+    )
     parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 50")
     parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
     parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
@@ -398,6 +509,9 @@ def load_dit_model(
     if args.fp8_scaled and not args.lycoris:
         loading_weight_dtype = None  # we will load weights as-is and then optimize to fp8
 
+    if sum(bool(getattr(args, name, False)) for name in ("linear_adapter", "mlp_adapter", "norm_linear_adapter", "omni_adapter")) > 1:
+        raise ValueError("Only one of --linear-adapter, --mlp-adapter, --norm-linear-adapter, and --omni-adapter can be enabled.")
+
     model = anima_utils.load_anima_model(
         device,
         args.dit,
@@ -413,6 +527,9 @@ def load_dit_model(
         ip_adapter_feature_dim=ip_feature_dim,
         ip_adapter_num_tokens=args.ip_adapter_num_tokens,
         ip_adapter_linear_adapter=getattr(args, "linear_adapter", False),
+        ip_adapter_mlp_adapter=getattr(args, "mlp_adapter", False),
+        ip_adapter_norm_linear_adapter=getattr(args, "norm_linear_adapter", False),
+        ip_adapter_omni_adapter=getattr(args, "omni_adapter", False),
     )
     if args.ip_adapter_weight is not None:
         if not args.ip_adapter:

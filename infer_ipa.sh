@@ -9,11 +9,10 @@ python anima_minimal_inference.py \
   --lora_weight out/anima_ipadapter_self_ref_overfit-step00028500.safetensors \
   --lora_multiplier 1.0 \
   --ip_adapter \
-  --linear-adapter \
+  --omni-adapter \
   --ip_adapter_weight out/anima_ipadapter_self_ref_overfit-step00028500_ip_adapter.safetensors \
-  --ip_adapter_feature_backend ccip \
-  --ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model \
-  --ip_adapter_num_tokens 8 \
+  --ip_adapter_feature_backend ccip_tokens \
+  --ip_adapter_feature_model /root/autodl-tmp/ckn/anima_edit/ccip-caformer_b36-24.ckpt \
   --no_reference_sequence \
   --infer_steps 30 \
   --guidance_scale 3.5

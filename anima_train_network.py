@@ -1,11 +1,14 @@
 # Anima LoRA training script
 
 import argparse
+import importlib.util
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+import types
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -55,6 +58,10 @@ class AnimaIPAdapterFeatureExtractor:
 
             self.extract_fn = ccip_batch_extract_features
             self.feature_dim = self._infer_ccip_dim(model_dir)
+        elif backend == "ccip_tokens":
+            if model_dir is None:
+                raise ValueError("--anima_ip_adapter_feature_model is required for CCIP token extraction.")
+            self.model, self.transform, self.feature_dim = self._load_ccip_tokens(model_dir, device)
         elif backend == "lsnet":
             if model_dir is None:
                 raise ValueError("--anima_ip_adapter_feature_model is required for LSNet feature extraction.")
@@ -72,6 +79,88 @@ class AnimaIPAdapterFeatureExtractor:
         except Exception as e:
             logger.warning(f"Could not infer CCIP feature dim from {model_dir}: {e}")
         return None
+
+    @staticmethod
+    def _find_ccip_checkpoint(model_path: str) -> str:
+        path = Path(model_path)
+        if path.is_file():
+            return str(path)
+        candidates = sorted(path.glob("*.ckpt")) + sorted(path.glob("*.pth")) + sorted(path.glob("*.pt"))
+        if not candidates:
+            raise FileNotFoundError(f"No CCIP .ckpt/.pth/.pt checkpoint found in: {model_path}")
+        return str(candidates[0])
+
+    @staticmethod
+    def _clean_ccip_state_dict(state_dict):
+        return {
+            key.removeprefix("module._orig_mod.").removeprefix("module.").removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+
+    @staticmethod
+    def _load_ccip_tokens(model_path: str, device: torch.device):
+        imgutils_root = Path(__file__).resolve().parent / "imgutils"
+        AnimaIPAdapterFeatureExtractor._prepare_imgutils_modules(imgutils_root)
+        from zoo.ccip.caformer import get_caformer
+
+        checkpoint = AnimaIPAdapterFeatureExtractor._find_ccip_checkpoint(model_path)
+        logger.info(f"Loading CCIP token backbone from: {checkpoint}")
+        state_dict = torch.load(checkpoint, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        state_dict = AnimaIPAdapterFeatureExtractor._clean_ccip_state_dict(state_dict)
+        first_conv = state_dict.get("feature.backbone.caformer.downsample_layers.0.conv.weight")
+        arch = "caformer_b36_384_in21ft1k" if first_conv is not None and first_conv.shape[0] == 128 else "caformer_s36_384_in21ft1k"
+        logger.info(f"Detected CCIP token backbone arch: {arch}")
+        backbone, transform = get_caformer(arch=arch, pretrained=False)
+        backbone_state = {
+            key.removeprefix("feature.backbone."): value
+            for key, value in state_dict.items()
+            if key.startswith("feature.backbone.")
+        }
+        missing, unexpected = backbone.load_state_dict(backbone_state, strict=False)
+        if unexpected:
+            logger.warning(f"Unexpected CCIP token backbone keys: {unexpected[:8]}")
+        if missing:
+            logger.warning(f"Missing CCIP token backbone keys: {missing[:8]}")
+        backbone.to(device)
+        backbone.eval()
+        logger.info(f"Loaded CCIP token backbone. feature_dim={backbone.caformer.output_dim}")
+        return backbone, transform, backbone.caformer.output_dim
+
+    @staticmethod
+    def _prepare_imgutils_modules(imgutils_root: Path) -> None:
+        try:
+            import timm.layers.helpers as timm_layer_helpers
+
+            sys.modules.setdefault("timm.models.layers.helpers", timm_layer_helpers)
+        except Exception:
+            pass
+
+        def ensure_package(name: str, path: Path) -> None:
+            module = sys.modules.get(name)
+            if module is None:
+                module = types.ModuleType(name)
+                module.__path__ = [str(path)]
+                sys.modules[name] = module
+
+        def load_module(name: str, path: Path) -> None:
+            if name in sys.modules:
+                return
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load {name} from {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+
+        ensure_package("zoo", imgutils_root / "zoo")
+        ensure_package("zoo.ccip", imgutils_root / "zoo" / "ccip")
+        ensure_package("zoo.monochrome", imgutils_root / "zoo" / "monochrome")
+        load_module("zoo.monochrome.metaformer_timm", imgutils_root / "zoo" / "monochrome" / "metaformer_timm.py")
+        load_module("zoo.monochrome.metaformer", imgutils_root / "zoo" / "monochrome" / "metaformer.py")
+        load_module("zoo.ccip.attention_pool", imgutils_root / "zoo" / "ccip" / "attention_pool.py")
+        load_module("zoo.ccip.caformer", imgutils_root / "zoo" / "ccip" / "caformer.py")
 
     @staticmethod
     def _find_lsnet_checkpoint(model_dir: str) -> str:
@@ -131,6 +220,19 @@ class AnimaIPAdapterFeatureExtractor:
             features = self.extract_fn(image_paths, model=self.model_dir)
             features = torch.from_numpy(np.asarray(features, dtype=np.float32))
             return features.to(device=self.device, dtype=self.dtype)
+        if self.backend == "ccip_tokens":
+            tensors = []
+            for path in image_paths:
+                image = Image.open(path).convert("RGB").resize((384, 384), resample=Image.BILINEAR)
+                tensor = transforms.ToTensor()(image)
+                for transform in self.transform:
+                    tensor = transform(tensor)
+                tensors.append(tensor)
+            batch = torch.stack(tensors).to(self.device)
+            with torch.no_grad():
+                fmap = self.model._get_cnn_result(batch)
+                features = fmap.flatten(2).transpose(1, 2).contiguous()
+            return features.reshape(-1, features.shape[-1]).to(dtype=self.dtype)
         if self.backend == "lsnet":
             tensors = [self.transform(Image.open(path).convert("RGB")) for path in image_paths]
             batch = torch.stack(tensors).to(self.device)
@@ -247,6 +349,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Load DiT
         logger.info(f"Loading Anima DiT model with attn_mode={attn_mode}, split_attn: {args.split_attn}...")
+        ip_linear_adapter = getattr(args, "linear_adapter", False) or getattr(args, "anima_ip_adapter_linear_adapter", False)
+        ip_mlp_adapter = getattr(args, "mlp_adapter", False) or getattr(args, "anima_ip_adapter_mlp_adapter", False)
+        ip_norm_linear_adapter = getattr(args, "norm_linear_adapter", False) or getattr(
+            args, "anima_ip_adapter_norm_linear_adapter", False
+        )
+        ip_omni_adapter = getattr(args, "omni_adapter", False) or getattr(args, "anima_ip_adapter_omni_adapter", False)
+        if sum(bool(v) for v in (ip_linear_adapter, ip_mlp_adapter, ip_norm_linear_adapter, ip_omni_adapter)) > 1:
+            raise ValueError("Only one of --linear-adapter, --mlp-adapter, --norm-linear-adapter, and --omni-adapter can be enabled.")
         model = anima_utils.load_anima_model(
             accelerator.device,
             args.pretrained_model_name_or_path,
@@ -259,8 +369,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             ip_adapter_scale=getattr(args, "anima_ip_adapter_scale", 1.0),
             ip_adapter_feature_dim=ip_feature_dim,
             ip_adapter_num_tokens=getattr(args, "anima_ip_adapter_num_tokens", 4),
-            ip_adapter_linear_adapter=getattr(args, "linear_adapter", False)
-            or getattr(args, "anima_ip_adapter_linear_adapter", False),
+            ip_adapter_linear_adapter=ip_linear_adapter,
+            ip_adapter_mlp_adapter=ip_mlp_adapter,
+            ip_adapter_norm_linear_adapter=ip_norm_linear_adapter,
+            ip_adapter_omni_adapter=ip_omni_adapter,
         )
 
         # Store unsloth preference so that when the base NetworkTrainer calls
@@ -377,7 +489,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     @staticmethod
     def is_ip_adapter_parameter_name(name: str) -> bool:
-        return name.startswith("visual_condition_adapter.") or ".ip_adapter." in name
+        return name.startswith("visual_condition_adapter.")
 
     @staticmethod
     def get_ip_adapter_parameters(unet):

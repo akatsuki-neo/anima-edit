@@ -239,6 +239,22 @@ class RMSNorm(torch.nn.Module):
             return output * self.weight
 
 
+class RMSNormNoAffine(torch.nn.Module):
+    """RMS normalization without trainable affine parameters."""
+
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        del dim
+        self.eps = eps
+
+    def reset_parameters(self) -> None:
+        pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+            return (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
+
+
 class GPT2FeedForward(nn.Module):
     """GELU feedforward network."""
 
@@ -380,22 +396,60 @@ class AnimaVisualConditionAdapter(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_feature_tokens: int = 4,
-        num_layers: int = 3,
+        num_layers: int = 2,
         mlp_ratio: float = 4.0,
         linear_adapter: bool = False,
+        mlp_adapter: bool = False,
+        norm_linear_adapter: bool = False,
+        omni_adapter: bool = False,
     ):
         super().__init__()
+        if sum(bool(v) for v in (linear_adapter, mlp_adapter, norm_linear_adapter, omni_adapter)) > 1:
+            raise ValueError("Only one of linear_adapter, mlp_adapter, norm_linear_adapter, and omni_adapter can be enabled.")
         if hidden_size % num_heads != 0:
             raise ValueError(f"Visual condition hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads}).")
         self.feature_dim = feature_dim
         self.hidden_size = hidden_size
         self.num_feature_tokens = num_feature_tokens
         self.linear_adapter = linear_adapter
-        self.feature_norm = RMSNorm(feature_dim, eps=1e-6)
+        self.mlp_adapter = mlp_adapter
+        self.norm_linear_adapter = norm_linear_adapter
+        self.omni_adapter = omni_adapter
         if self.linear_adapter:
             self.feature_proj = nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True)
             self.out_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        elif self.mlp_adapter:
+            self.feature_proj = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim * 2, bias=True),
+                nn.GELU(),
+                nn.Linear(feature_dim * 2, hidden_size * num_feature_tokens, bias=True),
+            )
+            self.out_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        elif self.norm_linear_adapter:
+            self.feature_norm = RMSNormNoAffine(feature_dim, eps=1e-6)
+            self.feature_proj = nn.Linear(feature_dim, hidden_size, bias=False)
+            self.feature_expand = nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=False)
+        elif self.omni_adapter:
+            self.feature_norm = RMSNorm(feature_dim, eps=1e-5)
+            self.feature_proj = nn.Linear(feature_dim, hidden_size, bias=True)
+            self.feature_expand = nn.Linear(feature_dim, hidden_size * num_feature_tokens, bias=True)
+            self.rotary_emb = AdapterRotaryEmbedding(hidden_size // num_heads)
+            self.image_rotary_emb = AdapterImageRotaryEmbedding(hidden_size // num_heads, rope_theta=256.0)
+            self.refiner = nn.ModuleList(
+                [
+                    OmniRefinerBlock(
+                        dim=hidden_size,
+                        num_heads=num_heads,
+                        mlp_ratio=8.0 / 3.0,
+                        norm_eps=1e-5,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+            self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.out_norm = nn.Identity()
         else:
+            self.feature_norm = RMSNorm(feature_dim, eps=1e-6)
             self.source_proj = nn.Linear(feature_dim, hidden_size, bias=True)
             self.visual_queries = nn.Parameter(torch.empty(num_feature_tokens, hidden_size))
             self.rotary_emb = AdapterRotaryEmbedding(hidden_size // num_heads)
@@ -416,13 +470,33 @@ class AnimaVisualConditionAdapter(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self.feature_norm.reset_parameters()
         std = 1.0 / math.sqrt(self.feature_dim)
         if self.linear_adapter:
             torch.nn.init.trunc_normal_(self.feature_proj.weight, std=std, a=-3 * std, b=3 * std)
             torch.nn.init.zeros_(self.feature_proj.bias)
             self.out_norm.reset_parameters()
+        elif self.mlp_adapter:
+            torch.nn.init.trunc_normal_(self.feature_proj[0].weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.feature_proj[0].bias)
+            hidden_std = 1.0 / math.sqrt(self.feature_dim * 2)
+            torch.nn.init.trunc_normal_(self.feature_proj[2].weight, std=hidden_std, a=-3 * hidden_std, b=3 * hidden_std)
+            torch.nn.init.zeros_(self.feature_proj[2].bias)
+            self.out_norm.reset_parameters()
+        elif self.norm_linear_adapter:
+            self.feature_norm.reset_parameters()
+            torch.nn.init.trunc_normal_(self.feature_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.feature_expand.weight, std=std, a=-3 * std, b=3 * std)
+        elif self.omni_adapter:
+            self.feature_norm.reset_parameters()
+            torch.nn.init.trunc_normal_(self.feature_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.feature_expand.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.feature_proj.bias)
+            torch.nn.init.zeros_(self.feature_expand.bias)
+            for layer in self.refiner:
+                layer.init_weights()
+            torch.nn.init.zeros_(self.out_proj.weight)
         else:
+            self.feature_norm.reset_parameters()
             torch.nn.init.trunc_normal_(self.source_proj.weight, std=std, a=-3 * std, b=3 * std)
             torch.nn.init.zeros_(self.source_proj.bias)
             query_std = 1.0 / math.sqrt(self.hidden_size)
@@ -451,11 +525,33 @@ class AnimaVisualConditionAdapter(nn.Module):
         if num_features == 0:
             return features.new_zeros((batch, 0, self.hidden_size))
 
-        if self.linear_adapter:
+        if self.linear_adapter or self.mlp_adapter:
             pooled = features.mean(dim=1)
-            tokens = self.feature_proj(self.feature_norm(pooled))
+            if self.mlp_adapter:
+                proj_weight = self.feature_proj[0].weight
+                tokens = self.feature_proj(pooled.to(proj_weight.dtype))
+            else:
+                tokens = self.feature_proj(pooled.to(self.feature_proj.weight.dtype))
             tokens = tokens.reshape(batch, self.num_feature_tokens, self.hidden_size)
             return self.out_norm(tokens)
+
+        if self.norm_linear_adapter:
+            normed = self.feature_norm(features).to(self.feature_proj.weight.dtype)
+            if num_features == 1:
+                tokens = self.feature_expand(normed[:, 0])
+                return tokens.reshape(batch, self.num_feature_tokens, self.hidden_size)
+            return self.feature_proj(normed)
+
+        if self.omni_adapter:
+            normed = self.feature_norm(features).to(self.feature_proj.weight.dtype)
+            if num_features == 1:
+                tokens = self.feature_expand(normed[:, 0]).reshape(batch, self.num_feature_tokens, self.hidden_size)
+            else:
+                tokens = self.feature_proj(normed)
+            position_embeddings = self._get_omni_position_embeddings(tokens)
+            for layer in self.refiner:
+                tokens = layer(tokens, position_embeddings=position_embeddings)
+            return self.out_proj(self.out_norm(tokens))
 
         source = self.source_proj(self.feature_norm(features))
         tokens = self.visual_queries.unsqueeze(0).expand(batch, -1, -1).to(dtype=source.dtype, device=source.device)
@@ -472,57 +568,21 @@ class AnimaVisualConditionAdapter(nn.Module):
         )
         return self.out_norm(tokens)
 
-    def uses_kv_injection(self) -> bool:
-        return self.linear_adapter
+    def _get_omni_position_embeddings(self, tokens: torch.Tensor):
+        seq_len = tokens.shape[1]
+        base_grid = int(math.isqrt(seq_len))
+        if base_grid * base_grid == seq_len:
+            return self.image_rotary_emb(tokens, (base_grid, base_grid), num_images=1)
 
+        # CCIP token mode gives 12x12 tokens per image. Preserve per-image 2D
+        # positions when multiple reference images are concatenated.
+        ccip_grid = 12
+        ccip_tokens_per_image = ccip_grid * ccip_grid
+        if seq_len % ccip_tokens_per_image == 0:
+            return self.image_rotary_emb(tokens, (ccip_grid, ccip_grid), num_images=seq_len // ccip_tokens_per_image)
 
-class AnimaIPAdapter(nn.Module):
-    def __init__(self, query_dim: int, context_dim: int, num_heads: int, scale: float = 1.0):
-        super().__init__()
-        if query_dim % num_heads != 0:
-            raise ValueError(f"IP-Adapter query_dim ({query_dim}) must be divisible by num_heads ({num_heads}).")
-        self.query_dim = query_dim
-        self.context_dim = context_dim
-        self.num_heads = num_heads
-        self.head_dim = query_dim // num_heads
-        self.scale = scale
-        self.to_k_ip = nn.Linear(context_dim, query_dim, bias=False)
-        self.to_v_ip = nn.Linear(context_dim, query_dim, bias=False)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-        self.v_norm = nn.Identity()
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        std = 1.0 / math.sqrt(self.context_dim)
-        torch.nn.init.trunc_normal_(self.to_k_ip.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.zeros_(self.to_v_ip.weight)
-        if hasattr(self.k_norm, "reset_parameters"):
-            self.k_norm.reset_parameters()
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        image_tokens: torch.Tensor,
-        attn_params: attention.AttentionParams,
-        query_len: Optional[int] = None,
-    ) -> torch.Tensor:
-        if image_tokens is None or image_tokens.shape[1] == 0 or self.scale == 0:
-            q = query[:, :query_len] if query_len is not None else query
-            return torch.zeros((q.shape[0], q.shape[1], self.query_dim), dtype=q.dtype, device=q.device)
-
-        q = query[:, :query_len] if query_len is not None else query
-        k = rearrange(self.to_k_ip(image_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
-        v = rearrange(self.to_v_ip(image_tokens), "b l (h d) -> b l h d", h=self.num_heads, d=self.head_dim)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
-
-        if q.dtype != v.dtype:
-            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
-
-        result = attention.attention([q, k, v], attn_params=attn_params)
-        return result.to(query.dtype) * self.scale
+        position_ids = torch.arange(seq_len, device=tokens.device).unsqueeze(0)
+        return self.rotary_emb(tokens, position_ids)
 
 
 # Positional Embeddings
@@ -982,7 +1042,6 @@ class Block(nn.Module):
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
-        self.ip_adapter: Optional[AnimaIPAdapter] = None
 
         self.use_adaln_lora = use_adaln_lora
         if self.use_adaln_lora:
@@ -1043,8 +1102,6 @@ class Block(nn.Module):
         self.self_attn.init_weights()
         self.cross_attn.init_weights()
         self.mlp.init_weights()
-        if self.ip_adapter is not None:
-            self.ip_adapter.reset_parameters()
 
     def enable_ip_adapter(
         self,
@@ -1052,23 +1109,15 @@ class Block(nn.Module):
         feature_dim: Optional[int] = None,
         num_feature_tokens: int = 4,
         linear_adapter: bool = False,
+        mlp_adapter: bool = False,
+        norm_linear_adapter: bool = False,
+        omni_adapter: bool = False,
     ) -> None:
         del feature_dim, num_feature_tokens
-        if not linear_adapter:
-            return
-        if self.ip_adapter is None:
-            self.ip_adapter = AnimaIPAdapter(
-                query_dim=self.x_dim,
-                context_dim=self.cross_attn.context_dim,
-                num_heads=self.self_attn.n_heads,
-                scale=scale,
-            )
-        else:
-            self.ip_adapter.scale = scale
+        del scale, linear_adapter, mlp_adapter, norm_linear_adapter, omni_adapter
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        if self.ip_adapter is not None:
-            self.ip_adapter.scale = scale
+        del scale
 
     def _forward(
         self,
@@ -1208,16 +1257,6 @@ class Block(nn.Module):
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_cross_attn, scale_cross, shift_cross)
         result = self.cross_attn(normalized_x, attn_params, crossattn_emb, rope_emb=rope_emb_L_1_1_D)
-        if self.ip_adapter is not None and ip_adapter_tokens is not None:
-            ip_query = self.cross_attn.q_proj(normalized_x)
-            ip_query = rearrange(ip_query, "b l (h d) -> b l h d", h=self.cross_attn.n_heads, d=self.cross_attn.head_dim)
-            ip_query = self.cross_attn.q_norm(ip_query)
-            ip_result = self.ip_adapter(ip_query, ip_adapter_tokens, attn_params, query_len=ip_adapter_query_len)
-            if ip_adapter_query_len is None or ip_adapter_query_len == result.shape[1]:
-                result = result + ip_result
-            else:
-                result = result.clone()
-                result[:, :ip_adapter_query_len] = result[:, :ip_adapter_query_len] + ip_result
         x_B_L_D = x_B_L_D + expand_param(gate_cross) * result
 
         normalized_x = adaln(x_B_L_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
@@ -1632,6 +1671,9 @@ class Anima(nn.Module):
         feature_dim: Optional[int] = None,
         num_feature_tokens: int = 4,
         linear_adapter: bool = False,
+        mlp_adapter: bool = False,
+        norm_linear_adapter: bool = False,
+        omni_adapter: bool = False,
     ) -> None:
         if feature_dim is None:
             return
@@ -1642,9 +1684,10 @@ class Anima(nn.Module):
                 num_heads=self.num_heads,
                 num_feature_tokens=num_feature_tokens,
                 linear_adapter=linear_adapter,
+                mlp_adapter=mlp_adapter,
+                norm_linear_adapter=norm_linear_adapter,
+                omni_adapter=omni_adapter,
             )
-        for block in self.blocks:
-            block.enable_ip_adapter(scale, feature_dim=feature_dim, num_feature_tokens=num_feature_tokens, linear_adapter=linear_adapter)
 
     def project_ip_adapter_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.visual_condition_adapter is None:
@@ -1653,8 +1696,7 @@ class Anima(nn.Module):
         return self.visual_condition_adapter(features, attn_params)
 
     def set_ip_adapter_scale(self, scale: float) -> None:
-        for block in self.blocks:
-            block.set_ip_adapter_scale(scale)
+        del scale
 
     def _prepare_reference_flat_tokens(
         self,
@@ -1856,13 +1898,7 @@ class Anima(nn.Module):
                     else:
                         sample_embeds = ip_adapter_embeds[batch_index : batch_index + 1]
                     tokens = self.project_ip_adapter_features(sample_embeds.to(x_i.device, x_i.dtype))
-                    if (
-                        self.visual_condition_adapter is not None
-                        and self.visual_condition_adapter.uses_kv_injection()
-                    ):
-                        ip_tokens = tokens
-                    else:
-                        visual_context_tokens.append(tokens)
+                    visual_context_tokens.append(tokens)
                 else:
                     for ref_index, ref_latent in enumerate((ip_adapter_latents[batch_index] if ip_adapter_latents is not None else []) or []):
                         if ref_latent.ndim == 4:
@@ -1905,8 +1941,8 @@ class Anima(nn.Module):
                         use_fp32,
                         rope_emb,
                         adaln_lora,
-                        ip_adapter_tokens=ip_tokens,
-                        ip_adapter_query_len=target_tokens.shape[1] if ip_tokens is not None else None,
+                        ip_adapter_tokens=None,
+                        ip_adapter_query_len=None,
                     )
                     if self.blocks_to_swap:
                         self.offloader.submit_move_blocks(self.blocks, block_idx)
@@ -2053,10 +2089,45 @@ class AdapterRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+class AdapterImageRotaryEmbedding(nn.Module):
+    """2D rotary embedding for visual token grids."""
+
+    def __init__(self, head_dim: int, rope_theta: float = 256.0):
+        super().__init__()
+        self.head_dim = head_dim
+        self.rope_theta = rope_theta
+        half_dim = head_dim // 2
+        if half_dim % 2 != 0:
+            raise ValueError(f"AdapterImageRotaryEmbedding requires head_dim/2 to be even, got head_dim={head_dim}.")
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, grid_hw: tuple[int, int], num_images: int = 1):
+        height, width = grid_hw
+        device = x.device
+        rows = torch.arange(height, device=device)
+        cols = torch.arange(width, device=device)
+        yy, xx = torch.meshgrid(rows, cols, indexing="ij")
+        pos_h = yy.reshape(-1).repeat(num_images)
+        pos_w = xx.reshape(-1).repeat(num_images)
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs_h = torch.outer(pos_h.float(), self.inv_freq.float())
+            freqs_w = torch.outer(pos_w.float(), self.inv_freq.float())
+            emb_h = torch.cat((freqs_h, freqs_h), dim=-1)
+            emb_w = torch.cat((freqs_w, freqs_w), dim=-1)
+            emb = torch.cat((emb_h, emb_w), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class LLMAdapterAttention(nn.Module):
     """Attention module for LLM Adapter with QK-norm and separate RoPE for query/key."""
 
-    def __init__(self, query_dim, context_dim, n_heads, head_dim):
+    def __init__(self, query_dim, context_dim, n_heads, head_dim, norm_eps=1e-6):
         super().__init__()
 
         inner_dim = head_dim * n_heads
@@ -2066,10 +2137,10 @@ class LLMAdapterAttention(nn.Module):
         self.context_dim = context_dim
 
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-        self.q_norm = LLMAdapterRMSNorm(self.head_dim)
+        self.q_norm = LLMAdapterRMSNorm(self.head_dim, eps=norm_eps)
 
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-        self.k_norm = LLMAdapterRMSNorm(self.head_dim)
+        self.k_norm = LLMAdapterRMSNorm(self.head_dim, eps=norm_eps)
 
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
 
@@ -2098,6 +2169,68 @@ class LLMAdapterAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
+
+
+class OmniFeedForward(nn.Module):
+    """SwiGLU feed-forward used by the omni visual refiner."""
+
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class OmniRefinerBlock(nn.Module):
+    """Single-stream visual token refiner for omni visual features.
+
+    The refiner is attention + SwiGLU FFN with RMSNorm before each branch and
+    RMSNorm on branch outputs before residual addition.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 8.0 / 3.0, norm_eps: float = 1e-6) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"OmniRefinerBlock dim ({dim}) must be divisible by num_heads ({num_heads}).")
+        self.attention_norm1 = LLMAdapterRMSNorm(dim, eps=norm_eps)
+        self.attention = LLMAdapterAttention(
+            query_dim=dim,
+            context_dim=dim,
+            n_heads=num_heads,
+            head_dim=dim // num_heads,
+            norm_eps=norm_eps,
+        )
+        self.attention_norm2 = LLMAdapterRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = LLMAdapterRMSNorm(dim, eps=norm_eps)
+        self.feed_forward = OmniFeedForward(dim=dim, hidden_dim=int(dim * mlp_ratio))
+        self.ffn_norm2 = LLMAdapterRMSNorm(dim, eps=norm_eps)
+
+    def forward(self, x: torch.Tensor, position_embeddings=None, attention_mask=None) -> torch.Tensor:
+        attn_out = self.attention(
+            self.attention_norm1(x),
+            mask=attention_mask,
+            position_embeddings=position_embeddings,
+            position_embeddings_context=position_embeddings,
+        )
+        x = x + self.attention_norm2(attn_out)
+        x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
+        return x
+
+    def init_weights(self) -> None:
+        dim = self.attention.query_dim
+        hidden_dim = self.feed_forward.w1.out_features
+        std = 1.0 / math.sqrt(dim)
+        torch.nn.init.trunc_normal_(self.attention.q_proj.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.attention.k_proj.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.attention.v_proj.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.feed_forward.w1.weight, std=std, a=-3 * std, b=3 * std)
+        torch.nn.init.trunc_normal_(self.feed_forward.w3.weight, std=std, a=-3 * std, b=3 * std)
+        out_std = 1.0 / math.sqrt(hidden_dim)
+        torch.nn.init.trunc_normal_(self.attention.o_proj.weight, std=out_std, a=-3 * out_std, b=3 * out_std)
+        torch.nn.init.trunc_normal_(self.feed_forward.w2.weight, std=out_std, a=-3 * out_std, b=3 * out_std)
 
 
 class LLMAdapterTransformerBlock(nn.Module):
