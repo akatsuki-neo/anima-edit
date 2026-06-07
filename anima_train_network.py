@@ -335,7 +335,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         def save_weights_with_ip(file, dtype, metadata):
             if not getattr(args, "anima_disable_network_training", False):
+                logger.info(f"Saving LoRA/LyCORIS weights to: {file}")
                 original_save(file, dtype, metadata)
+            else:
+                logger.info("Skipping LoRA/LyCORIS weight save because --anima_disable_network_training is enabled.")
             if getattr(args, "anima_train_ip_adapter", False):
                 ip_file = self.get_ip_adapter_output_path(file)
                 self.save_ip_adapter_weights(unet, ip_file, dtype, metadata)
