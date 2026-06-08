@@ -954,7 +954,7 @@ def sample_images(
     dit.switch_block_swap_for_inference()
 
     if args.anima_sample_reference_dir is not None:
-        prompts = _load_reference_sample_prompts(args.anima_sample_reference_dir, getattr(args, "anima_sample_max_references", 4))
+        prompts = _load_reference_sample_prompts(args.anima_sample_reference_dir, getattr(args, "anima_sample_max_references", 0))
         if len(prompts) == 0:
             logger.error(f"No image/txt sample pairs found in: {args.anima_sample_reference_dir}")
             return
