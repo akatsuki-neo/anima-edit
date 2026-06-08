@@ -1027,7 +1027,7 @@ def _sample_image_inference(
     negative_prompt = prompt_dict.get("negative_prompt", "")
     sample_steps = prompt_dict.get("sample_steps", 30)
     width = prompt_dict.get("width", 1024)
-    height = prompt_dict.get("height", 1536)
+    height = prompt_dict.get("height", 1024)
     scale = prompt_dict.get("scale", 5.0)
     seed = prompt_dict.get("seed")
     flow_shift = prompt_dict.get("flow_shift", 3.0)
