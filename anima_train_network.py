@@ -638,14 +638,39 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             "grad_norm": math.sqrt(grad_sq) if has_grad else None,
         }
 
+    @staticmethod
+    def get_lora_norms(network):
+        param_sq = 0.0
+        grad_sq = 0.0
+        has_param = False
+        has_grad = False
+        with torch.no_grad():
+            for param in network.parameters():
+                if not param.requires_grad:
+                    continue
+                has_param = True
+                param_sq += param.detach().float().pow(2).sum().item()
+                if param.grad is not None:
+                    has_grad = True
+                    grad_sq += param.grad.detach().float().pow(2).sum().item()
+        return {
+            "param_norm": math.sqrt(param_sq) if has_param else None,
+            "grad_norm": math.sqrt(grad_sq) if has_grad else None,
+        }
+
     def all_reduce_network(self, accelerator, network):
         super().all_reduce_network(accelerator, network)
+        network = accelerator.unwrap_model(network)
+        self._current_network_for_logging = network
+        self._last_lora_grad_norm = self.get_lora_norms(network)["grad_norm"]
         unet = getattr(self, "_current_unet_for_logging", None)
         if unet is not None:
             self._last_ip_adapter_grad_norm = self.get_ip_adapter_norms(unet)["grad_norm"]
 
     def on_after_gradient_clip(self, accelerator, network):
-        del accelerator, network
+        network = accelerator.unwrap_model(network)
+        self._current_network_for_logging = network
+        self._last_lora_grad_norm = self.get_lora_norms(network)["grad_norm"]
         unet = getattr(self, "_current_unet_for_logging", None)
         if unet is not None:
             self._last_ip_adapter_grad_norm = self.get_ip_adapter_norms(unet)["grad_norm"]
@@ -684,6 +709,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             mean_grad_norm,
             mean_combined_norm,
         )
+        if not getattr(args, "anima_disable_network_training", False):
+            network_for_logging = getattr(self, "_current_network_for_logging", None)
+            if network_for_logging is not None:
+                lora_norms = self.get_lora_norms(network_for_logging)
+                if lora_norms["param_norm"] is not None:
+                    logs["lora/param_norm"] = lora_norms["param_norm"]
+                lora_grad_norm = lora_norms["grad_norm"]
+                if lora_grad_norm is None:
+                    lora_grad_norm = getattr(self, "_last_lora_grad_norm", None)
+                if lora_grad_norm is not None:
+                    logs["lora/grad_norm"] = lora_grad_norm
         unet = getattr(self, "_current_unet_for_logging", None)
         if getattr(args, "anima_ip_adapter", False) and unet is not None:
             norms = self.get_ip_adapter_norms(unet)
