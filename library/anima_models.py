@@ -574,12 +574,12 @@ class AnimaVisualConditionAdapter(nn.Module):
         if base_grid * base_grid == seq_len:
             return self.image_rotary_emb(tokens, (base_grid, base_grid), num_images=1)
 
-        # CCIP token mode gives 12x12 tokens per image. Preserve per-image 2D
+        # Known grid sizes for different feature backends. Preserve per-image 2D
         # positions when multiple reference images are concatenated.
-        ccip_grid = 12
-        ccip_tokens_per_image = ccip_grid * ccip_grid
-        if seq_len % ccip_tokens_per_image == 0:
-            return self.image_rotary_emb(tokens, (ccip_grid, ccip_grid), num_images=seq_len // ccip_tokens_per_image)
+        for grid_size, grid_name in [(12, "CCIP"), (16, "SigLIP2")]:
+            tokens_per_image = grid_size * grid_size
+            if seq_len % tokens_per_image == 0:
+                return self.image_rotary_emb(tokens, (grid_size, grid_size), num_images=seq_len // tokens_per_image)
 
         position_ids = torch.arange(seq_len, device=tokens.device).unsqueeze(0)
         return self.rotary_emb(tokens, position_ids)
