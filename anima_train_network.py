@@ -62,6 +62,10 @@ class AnimaIPAdapterFeatureExtractor:
             if model_dir is None:
                 raise ValueError("--anima_ip_adapter_feature_model is required for CCIP token extraction.")
             self.model, self.transform, self.feature_dim = self._load_ccip_tokens(model_dir, device)
+        elif backend == "siglip2_tokens":
+            if model_dir is None:
+                raise ValueError("--anima_ip_adapter_feature_model is required for SigLIP2 token extraction.")
+            self.model, self.transform, self.feature_dim = self._load_siglip2_tokens(model_dir, device)
         elif backend == "lsnet":
             if model_dir is None:
                 raise ValueError("--anima_ip_adapter_feature_model is required for LSNet feature extraction.")
@@ -163,6 +167,19 @@ class AnimaIPAdapterFeatureExtractor:
         load_module("zoo.ccip.caformer", imgutils_root / "zoo" / "ccip" / "caformer.py")
 
     @staticmethod
+    def _load_siglip2_tokens(model_path: str, device: torch.device):
+        from transformers import Siglip2VisionModel, Siglip2ImageProcessor
+
+        logger.info(f"Loading SigLIP2 vision model from: {model_path}")
+        processor = Siglip2ImageProcessor.from_pretrained(model_path)
+        vision_model = Siglip2VisionModel.from_pretrained(model_path)
+        vision_model.to(device)
+        vision_model.eval()
+        feature_dim = vision_model.config.hidden_size
+        logger.info(f"Loaded SigLIP2 vision model. feature_dim={feature_dim}")
+        return vision_model, processor, feature_dim
+
+    @staticmethod
     def _find_lsnet_checkpoint(model_dir: str) -> str:
         candidates = sorted(Path(model_dir).glob("*.pth")) + sorted(Path(model_dir).glob("*.pt"))
         if not candidates:
@@ -232,6 +249,21 @@ class AnimaIPAdapterFeatureExtractor:
             with torch.no_grad():
                 fmap = self.model._get_cnn_result(batch)
                 features = fmap.flatten(2).transpose(1, 2).contiguous()
+            return features.reshape(-1, features.shape[-1]).to(dtype=self.dtype)
+        if self.backend == "siglip2_tokens":
+            images = [Image.open(path).convert("RGB") for path in image_paths]
+            inputs = self.transform(images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
+            pixel_attention_mask = inputs["pixel_attention_mask"].to(self.device)
+            spatial_shapes = inputs["spatial_shapes"].to(self.device)
+            with torch.no_grad():
+                vision_outputs = self.model(
+                    pixel_values=pixel_values,
+                    pixel_attention_mask=pixel_attention_mask,
+                    spatial_shapes=spatial_shapes,
+                )
+                # last_hidden_state: (B, num_patches, hidden_size) — 256 patches for naflex max_num_patches=256
+                features = vision_outputs.last_hidden_state
             return features.reshape(-1, features.shape[-1]).to(dtype=self.dtype)
         if self.backend == "lsnet":
             tensors = [self.transform(Image.open(path).convert("RGB")) for path in image_paths]
@@ -326,14 +358,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
         ip_feature_dim = args.anima_ip_adapter_feature_dim
         if getattr(args, "anima_ip_adapter", False) and args.anima_ip_adapter_feature_backend != "vae":
-            extractor = AnimaIPAdapterFeatureExtractor(
-                args.anima_ip_adapter_feature_backend,
-                args.anima_ip_adapter_feature_model,
-                accelerator.device,
-                weight_dtype,
-            )
-            self.ip_adapter_feature_extractor = extractor
-            ip_feature_dim = ip_feature_dim or extractor.feature_dim
+            precomputed_dir = getattr(args, "anima_ip_adapter_precomputed_emb_dir", None)
+            if precomputed_dir:
+                # Skip loading the feature extractor — embeddings are precomputed on disk
+                self.ip_adapter_feature_extractor = None
+                logger.info(f"Using precomputed embeddings from: {precomputed_dir}")
+            else:
+                extractor = AnimaIPAdapterFeatureExtractor(
+                    args.anima_ip_adapter_feature_backend,
+                    args.anima_ip_adapter_feature_model,
+                    accelerator.device,
+                    weight_dtype,
+                )
+                self.ip_adapter_feature_extractor = extractor
+            ip_feature_dim = ip_feature_dim or self.ip_adapter_feature_extractor.feature_dim if self.ip_adapter_feature_extractor else ip_feature_dim
             if ip_feature_dim is None:
                 raise ValueError(
                     "Could not infer IP-Adapter feature dim. Please pass --anima_ip_adapter_feature_dim."
@@ -837,16 +875,32 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if reference_image_paths is None or not any(len(paths or []) > 0 for paths in reference_image_paths):
             return None
 
-        if self.ip_adapter_feature_extractor is None:
-            raise ValueError("IP-Adapter feature extractor was not initialized.")
+        # Precomputed embedding path
+        precomputed_dir = getattr(args, "anima_ip_adapter_precomputed_emb_dir", None)
 
         sample_features = []
         for sample_paths in reference_image_paths:
             paths = [path for path in (sample_paths or []) if path]
-            if paths:
-                features = self.ip_adapter_feature_extractor.extract(paths).to(accelerator.device, dtype=weight_dtype)
+            if not paths:
+                feature_dim = self.ip_adapter_feature_extractor.feature_dim if self.ip_adapter_feature_extractor is not None else 1152
+                sample_features.append(torch.zeros((0, feature_dim), device=accelerator.device, dtype=weight_dtype))
+                continue
+
+            if precomputed_dir:
+                # Load precomputed .pt embeddings from disk
+                embs = []
+                for path in paths:
+                    stem = Path(path).stem
+                    emb_path = os.path.join(precomputed_dir, f"{stem}.pt")
+                    if not os.path.exists(emb_path):
+                        raise FileNotFoundError(f"Precomputed embedding not found: {emb_path}")
+                    emb = torch.load(emb_path, map_location=accelerator.device, weights_only=True)
+                    embs.append(emb.to(dtype=weight_dtype))
+                features = torch.cat(embs, dim=0)
             else:
-                features = torch.zeros((0, self.ip_adapter_feature_extractor.feature_dim), device=accelerator.device, dtype=weight_dtype)
+                if self.ip_adapter_feature_extractor is None:
+                    raise ValueError("IP-Adapter feature extractor was not initialized and no precomputed embedding dir is set.")
+                features = self.ip_adapter_feature_extractor.extract(paths).to(accelerator.device, dtype=weight_dtype)
             sample_features.append(features)
 
         if not any(features.shape[0] > 0 for features in sample_features):

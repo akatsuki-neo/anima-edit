@@ -56,6 +56,8 @@ class IPAdapterFeatureExtractor:
             self.feature_dim = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else None
         elif backend == "ccip_tokens":
             self.model, self.transform, self.feature_dim = self._load_ccip_tokens(model_dir, device)
+        elif backend == "siglip2_tokens":
+            self.model, self.transform, self.feature_dim = self._load_siglip2_tokens(model_dir, device)
         elif backend == "lsnet":
             self.model, self.transform, self.feature_dim = self._load_lsnet(model_dir, device)
 
@@ -137,6 +139,18 @@ class IPAdapterFeatureExtractor:
         load_module("zoo.ccip.caformer", imgutils_root / "zoo" / "ccip" / "caformer.py")
 
     @staticmethod
+    def _load_siglip2_tokens(model_path, device):
+        from transformers import Siglip2VisionModel, Siglip2ImageProcessor
+
+        logger.info(f"Loading SigLIP2 vision model from: {model_path}")
+        processor = Siglip2ImageProcessor.from_pretrained(model_path)
+        vision_model = Siglip2VisionModel.from_pretrained(model_path)
+        vision_model.to(device).eval()
+        feature_dim = vision_model.config.hidden_size
+        logger.info(f"Loaded SigLIP2 vision model. feature_dim={feature_dim}")
+        return vision_model, processor, feature_dim
+
+    @staticmethod
     def _find_lsnet_checkpoint(model_dir):
         candidates = sorted(Path(model_dir).glob("*.pth")) + sorted(Path(model_dir).glob("*.pt"))
         if not candidates:
@@ -194,6 +208,20 @@ class IPAdapterFeatureExtractor:
                 fmap = self.model._get_cnn_result(batch)
                 features = fmap.flatten(2).transpose(1, 2).contiguous()
             return features.reshape(1, -1, features.shape[-1]).to(dtype=self.dtype)
+        if self.backend == "siglip2_tokens":
+            images = [Image.open(path).convert("RGB") for path in paths]
+            inputs = self.transform(images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
+            pixel_attention_mask = inputs["pixel_attention_mask"].to(self.device)
+            spatial_shapes = inputs["spatial_shapes"].to(self.device)
+            with torch.no_grad():
+                vision_outputs = self.model(
+                    pixel_values=pixel_values,
+                    pixel_attention_mask=pixel_attention_mask,
+                    spatial_shapes=spatial_shapes,
+                )
+                features = vision_outputs.last_hidden_state
+            return features.reshape(1, -1, features.shape[-1]).to(dtype=self.dtype)
         if self.backend == "lsnet":
             tensors = [self.transform(Image.open(path).convert("RGB")) for path in paths]
             with torch.no_grad():
@@ -249,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ip_adapter", action="store_true", help="Use reference image(s) through Anima IP-Adapter instead of token concat")
     parser.add_argument("--ip_adapter_scale", type=float, default=1.0, help="Scale for Anima IP-Adapter conditioning")
     parser.add_argument("--ip_adapter_weight", type=str, default=None, help="Anima IP-Adapter safetensors weight path")
-    parser.add_argument("--ip_adapter_feature_backend", type=str, default="vae", choices=["vae", "ccip", "ccip_tokens", "lsnet"])
+    parser.add_argument("--ip_adapter_feature_backend", type=str, default="vae", choices=["vae", "ccip", "ccip_tokens", "lsnet", "siglip2_tokens"])
     parser.add_argument("--ip_adapter_feature_model", type=str, default=None, help="CCIP, CCIP token, or LSNet model directory/checkpoint")
     parser.add_argument("--ip_adapter_feature_dim", type=int, default=None)
     parser.add_argument("--ip_adapter_num_tokens", type=int, default=4)

@@ -49,8 +49,23 @@ class AnimaSampleIPFeatureExtractor:
             self.feature_dim = shape[-1] if len(shape) >= 2 and isinstance(shape[-1], int) else None
         elif backend == "ccip_tokens":
             self.model, self.transform, self.feature_dim = self._load_ccip_tokens(model_dir, device)
+        elif backend == "siglip2_tokens":
+            self.model, self.transform, self.feature_dim = self._load_siglip2_tokens(model_dir, device)
         elif backend == "lsnet":
             self.model, self.transform, self.feature_dim = self._load_lsnet(model_dir, device)
+
+    @staticmethod
+    def _load_siglip2_tokens(model_path: str, device: torch.device):
+        from transformers import Siglip2VisionModel, Siglip2ImageProcessor
+
+        logger.info(f"Loading SigLIP2 vision model (sample) from: {model_path}")
+        processor = Siglip2ImageProcessor.from_pretrained(model_path)
+        vision_model = Siglip2VisionModel.from_pretrained(model_path)
+        vision_model.to(device)
+        vision_model.eval()
+        feature_dim = vision_model.config.hidden_size
+        logger.info(f"Loaded SigLIP2 vision model (sample). feature_dim={feature_dim}")
+        return vision_model, processor, feature_dim
 
     @staticmethod
     def _find_ccip_checkpoint(model_path):
@@ -178,6 +193,20 @@ class AnimaSampleIPFeatureExtractor:
             with torch.no_grad():
                 fmap = self.model._get_cnn_result(batch)
                 features = fmap.flatten(2).transpose(1, 2).contiguous()
+            return features.reshape(1, -1, features.shape[-1]).to(dtype=self.dtype)
+        if self.backend == "siglip2_tokens":
+            images = [Image.open(path).convert("RGB") for path in image_paths]
+            inputs = self.transform(images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
+            pixel_attention_mask = inputs["pixel_attention_mask"].to(self.device)
+            spatial_shapes = inputs["spatial_shapes"].to(self.device)
+            with torch.no_grad():
+                vision_outputs = self.model(
+                    pixel_values=pixel_values,
+                    pixel_attention_mask=pixel_attention_mask,
+                    spatial_shapes=spatial_shapes,
+                )
+                features = vision_outputs.last_hidden_state
             return features.reshape(1, -1, features.shape[-1]).to(dtype=self.dtype)
         if self.backend == "lsnet":
             tensors = [self.transform(Image.open(path).convert("RGB")) for path in image_paths]
@@ -333,7 +362,7 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--anima_ip_adapter_feature_backend",
         type=str,
         default="vae",
-        choices=["vae", "ccip", "ccip_tokens", "lsnet"],
+        choices=["vae", "ccip", "ccip_tokens", "lsnet", "siglip2_tokens"],
         help="Feature extractor for Anima IP-Adapter references. 'vae' reuses reference latent tokens.",
     )
     parser.add_argument(
@@ -347,6 +376,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=None,
         help="Override IP-Adapter feature dimension if it cannot be inferred automatically.",
+    )
+    parser.add_argument(
+        "--anima_ip_adapter_precomputed_emb_dir",
+        type=str,
+        default=None,
+        help="Directory with precomputed .pt embedding files. When set, features are loaded from disk "
+        "instead of running the feature extractor at training time. Each .pt file should have the "
+        "same stem as the corresponding image file.",
     )
     parser.add_argument(
         "--anima_ip_adapter_num_tokens",
@@ -412,6 +449,12 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         type=str,
         default=None,
         help="Directory containing image/txt pairs for sampling. Each image is used as reference and the matching txt as prompt.",
+    )
+    parser.add_argument(
+        "--anima_sample_max_references",
+        type=int,
+        default=4,
+        help="Maximum number of reference images to sample when using --anima_sample_reference_dir. Default: 4",
     )
 
 
@@ -697,7 +740,7 @@ def do_sample(
     return x
 
 
-def _load_reference_sample_prompts(sample_reference_dir: str) -> list[dict]:
+def _load_reference_sample_prompts(sample_reference_dir: str, max_references: int = 0) -> list[dict]:
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     ref_suffix_re = re.compile(r"_ref\d*$", re.IGNORECASE)
     prompts = []
@@ -756,6 +799,11 @@ def _load_reference_sample_prompts(sample_reference_dir: str) -> list[dict]:
                 continue
             seen_targets.add(prompt_key)
             prompts.append({"prompt": prompt, "image": ref_paths or image_path})
+    if max_references > 0 and len(prompts) > max_references:
+        import random as _random
+        _random.seed(42)
+        prompts = _random.sample(prompts, max_references)
+        logger.info(f"Trimmed sample references to {max_references} (from {len(seen_targets)} total)")
     logger.info(f"Loaded {len(prompts)} Anima reference sample prompt(s) from: {sample_reference_dir}")
     return prompts
 
@@ -906,7 +954,7 @@ def sample_images(
     dit.switch_block_swap_for_inference()
 
     if args.anima_sample_reference_dir is not None:
-        prompts = _load_reference_sample_prompts(args.anima_sample_reference_dir)
+        prompts = _load_reference_sample_prompts(args.anima_sample_reference_dir, getattr(args, "anima_sample_max_references", 4))
         if len(prompts) == 0:
             logger.error(f"No image/txt sample pairs found in: {args.anima_sample_reference_dir}")
             return
@@ -978,9 +1026,9 @@ def _sample_image_inference(
     prompt = prompt_dict.get("prompt", "")
     negative_prompt = prompt_dict.get("negative_prompt", "")
     sample_steps = prompt_dict.get("sample_steps", 30)
-    width = prompt_dict.get("width", 512)
-    height = prompt_dict.get("height", 512)
-    scale = prompt_dict.get("scale", 7.5)
+    width = prompt_dict.get("width", 1024)
+    height = prompt_dict.get("height", 1536)
+    scale = prompt_dict.get("scale", 5.0)
     seed = prompt_dict.get("seed")
     flow_shift = prompt_dict.get("flow_shift", 3.0)
 
