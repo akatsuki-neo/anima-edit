@@ -781,6 +781,7 @@ def _load_reference_sample_prompts(sample_reference_dir: str, max_references: in
                 prompt = f.read().strip()
             if not prompt:
                 continue
+            prompt_dict = train_util.line_to_prompt_dict(prompt)
 
             ref_paths = []
             direct_ref = image_by_stem.get(f"{stem_name}_ref")
@@ -797,12 +798,13 @@ def _load_reference_sample_prompts(sample_reference_dir: str, max_references: in
                 continue
 
             ref_key = tuple(os.path.normcase(os.path.abspath(path)) for path in (ref_paths or [image_path]))
-            prompt_key = (ref_key, prompt)
+            prompt_key = (ref_key, prompt_dict.get("prompt", ""))
             if prompt_key in seen_targets:
                 logger.warning(f"Skipping duplicate Anima sample prompt: {txt_path}")
                 continue
             seen_targets.add(prompt_key)
-            prompts.append({"prompt": prompt, "image": ref_paths or image_path})
+            prompt_dict["image"] = ref_paths or image_path
+            prompts.append(prompt_dict)
     if max_references > 0 and len(prompts) > max_references:
         import random as _random
         _random.seed(42)
