@@ -17,8 +17,8 @@ accelerate launch anima_train_network.py \
   --vae /root/autodl-tmp/ComfyUI/models/vae/qwen_image_vae.safetensors \
   --qwen3 /root/autodl-tmp/ckn/qwen3 \
   --t5_tokenizer_path configs/t5_old \
-  --train_data_dir /root/autodl-tmp/ckn/downloaded_images \
-  --output_dir out \
+  --train_data_dir /root/autodl-tmp/ckn/anima-edit-action-transfer-12-akatsuki-vlm \
+  --output_dir out_edit \
   --output_name anima_self_ref_overfit \
   --network_module networks.lora_anima \
   --network_dim 128 \
@@ -37,12 +37,11 @@ accelerate launch anima_train_network.py \
   --bucket_reso_steps 16 \
   --caption_extension .txt \
   --anima_multi_image_edit \
-  --anima_self_reference_test \
   --gradient_checkpointing \
   --log_with wandb \
   --logging_dir logs \
   --log_tracker_name anima-edit \
   --wandb_run_name anima_self_ref_overfit \
-  --sample_every_n_steps 100 \
-  --anima_sample_reference_dir /root/autodl-tmp/ckn/test \
-  --save_every_n_steps 500 \
+  --sample_every_n_steps 50 \
+  --anima_sample_reference_dir /root/autodl-tmp/ckn/etest \
+  --save_every_n_steps 200 \
