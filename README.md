@@ -2,7 +2,7 @@
 
 大概流程和kohya ss的sd-scripts训练lora的流程是一样的
 
-要用cui跑训练出来的东西的话用这个节点`https://github.com/spawner1145/comfyui-adapters.git`
+要用cui跑训练出来的东西的话用这个节点https://github.com/spawner1145/comfyui-adapters.git
 
 # 首先, 数据集
 
