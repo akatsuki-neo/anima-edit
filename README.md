@@ -41,7 +41,7 @@
 --anima_ip_adapter_lr 5e-5 \
 ```
 
-这里的ccip文件可以在https://huggingface.co/deepghs/ccip/blob/main/ccip-caformer_b36-24.ckpt这里拿到
+这里的ccip文件可以在这里拿到:https://huggingface.co/deepghs/ccip/blob/main/ccip-caformer_b36-24.ckpt
 
 训练latent参考时, 开lora训练以及加`--anima_multi_image_edit`这个参数
 
