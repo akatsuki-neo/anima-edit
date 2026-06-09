@@ -2,7 +2,6 @@
 
 import argparse
 import gc
-import importlib.util
 import json
 import math
 import os
@@ -11,7 +10,6 @@ import re
 import sys
 import time
 from types import SimpleNamespace
-import types
 from typing import Optional
 
 import numpy as np
@@ -86,9 +84,7 @@ class AnimaSampleIPFeatureExtractor:
 
     @staticmethod
     def _load_ccip_tokens(model_path, device):
-        imgutils_root = Path(__file__).resolve().parents[1] / "imgutils"
-        AnimaSampleIPFeatureExtractor._prepare_imgutils_modules(imgutils_root)
-        from zoo.ccip.caformer import get_caformer
+        from ccip_lib.models.caformer import get_caformer
 
         checkpoint = AnimaSampleIPFeatureExtractor._find_ccip_checkpoint(model_path)
         logger.info(f"Loading CCIP token backbone from: {checkpoint}")
@@ -109,40 +105,6 @@ class AnimaSampleIPFeatureExtractor:
         backbone.to(device).eval()
         logger.info(f"Loaded CCIP token backbone. feature_dim={backbone.caformer.output_dim}")
         return backbone, transform, backbone.caformer.output_dim
-
-    @staticmethod
-    def _prepare_imgutils_modules(imgutils_root: Path) -> None:
-        try:
-            import timm.layers.helpers as timm_layer_helpers
-
-            sys.modules.setdefault("timm.models.layers.helpers", timm_layer_helpers)
-        except Exception:
-            pass
-
-        def ensure_package(name: str, path: Path) -> None:
-            module = sys.modules.get(name)
-            if module is None:
-                module = types.ModuleType(name)
-                module.__path__ = [str(path)]
-                sys.modules[name] = module
-
-        def load_module(name: str, path: Path) -> None:
-            if name in sys.modules:
-                return
-            spec = importlib.util.spec_from_file_location(name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Could not load {name} from {path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-
-        ensure_package("zoo", imgutils_root / "zoo")
-        ensure_package("zoo.ccip", imgutils_root / "zoo" / "ccip")
-        ensure_package("zoo.monochrome", imgutils_root / "zoo" / "monochrome")
-        load_module("zoo.monochrome.metaformer_timm", imgutils_root / "zoo" / "monochrome" / "metaformer_timm.py")
-        load_module("zoo.monochrome.metaformer", imgutils_root / "zoo" / "monochrome" / "metaformer.py")
-        load_module("zoo.ccip.attention_pool", imgutils_root / "zoo" / "ccip" / "attention_pool.py")
-        load_module("zoo.ccip.caformer", imgutils_root / "zoo" / "ccip" / "caformer.py")
 
     @staticmethod
     def _find_lsnet_checkpoint(model_dir):
