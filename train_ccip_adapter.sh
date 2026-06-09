@@ -21,7 +21,6 @@ accelerate launch anima_train_network.py \
   --caption_extension .txt \
   --anima_ip_adapter \
   --anima_train_ip_adapter \
-  --anima_disable_network_training \
   --anima_self_reference_test \
   --gradient_checkpointing \
   --log_with wandb \
@@ -32,6 +31,6 @@ accelerate launch anima_train_network.py \
   --anima_sample_reference_dir /root/autodl-tmp/ckn/test \
   --anima_ip_adapter_feature_backend ccip_tokens \
   --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model/ccip-caformer_b36-24.ckpt \
-  --anima_ip_adapter_lr 1e-4 \
+  --anima_ip_adapter_lr 5e-5 \
   --save_every_n_steps 2000 \
   --omni-adapter

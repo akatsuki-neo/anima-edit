@@ -1,3 +1,5 @@
+# 注意没训练latent参考的时候这个必开--no_reference_sequence
+
 python anima_minimal_inference.py \
   --dit /root/autodl-tmp/ComfyUI/models/diffusion_models/anima-base-v1.0.safetensors \
   --vae /root/autodl-tmp/ComfyUI/models/vae/qwen_image_vae.safetensors \

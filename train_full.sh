@@ -25,7 +25,6 @@ accelerate launch anima_train_network.py \
   --anima_multi_image_edit \
   --anima_ip_adapter \
   --anima_train_ip_adapter \
-  --anima_self_reference_test \
   --gradient_checkpointing \
   --log_with wandb \
   --logging_dir logs \
@@ -33,8 +32,8 @@ accelerate launch anima_train_network.py \
   --wandb_run_name anima_multi_ipadapter_self_ref_overfit \
   --sample_every_n_steps 100 \
   --anima_sample_reference_dir /root/autodl-tmp/ckn/test \
-  --anima_ip_adapter_feature_backend ccip \
-  --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model \
-  --anima_ip_adapter_num_tokens 8 \
-  --linear-adapter \
+  --anima_ip_adapter_feature_backend ccip_tokens \
+  --anima_ip_adapter_feature_model /root/autodl-tmp/ckn/ccip_model/ccip-caformer_b36-24.ckpt \
+  --anima_ip_adapter_lr 5e-5 \
+  --omni-adapter \
   --save_every_n_steps 500
