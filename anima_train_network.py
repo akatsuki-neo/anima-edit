@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -413,6 +414,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             if len(ip_params) == 0:
                 raise ValueError("--anima_ip_adapter_weights requires --anima_ip_adapter so IP-Adapter layers exist.")
             self.load_ip_adapter_weights(unet, args.anima_ip_adapter_weights)
+        if getattr(args, "anima_preference_training", False):
+            self._reference_ip_adapter_state = (
+                {key: value.detach().clone().cpu() for key, value in self.get_ip_adapter_state_dict(unet).items()}
+                if len(ip_params) > 0
+                else None
+            )
+            self._reference_network_state = None
 
         if not getattr(args, "anima_train_ip_adapter", False):
             for param in ip_params:
@@ -535,6 +543,106 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if unexpected:
             raise ValueError(f"Unexpected keys while loading IP-Adapter: {unexpected}")
         return info
+
+    def load_ip_adapter_state_dict(self, unet, state_dict):
+        if not state_dict:
+            return None
+        device_state = {
+            key: value.to(device=param.device, dtype=param.dtype)
+            for key, value in state_dict.items()
+            for name, param in unet.named_parameters()
+            if name == key
+        }
+        return unet.load_state_dict(device_state, strict=False)
+
+    @staticmethod
+    def get_network_state_dict(network):
+        return {key: value.detach().clone().cpu() for key, value in network.state_dict().items()}
+
+    @staticmethod
+    def load_network_state_dict(network, state_dict):
+        if not state_dict:
+            return None
+        current = network.state_dict()
+        device_state = {
+            key: value.to(device=current[key].device, dtype=current[key].dtype)
+            for key, value in state_dict.items()
+            if key in current and torch.is_tensor(current[key])
+        }
+        return network.load_state_dict(device_state, strict=False)
+
+    def capture_reference_policy_state(self, args, network, unet):
+        if not getattr(args, "anima_preference_training", False):
+            return
+        self._reference_network_state = self.get_network_state_dict(network)
+        self._reference_ip_adapter_state = (
+            {key: value.detach().clone().cpu() for key, value in self.get_ip_adapter_state_dict(unet).items()}
+            if any(True for _ in self.get_ip_adapter_parameters(unet))
+            else None
+        )
+
+    def get_reference_policy_predictions(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        batch,
+        text_encoder_conds,
+        unet,
+        network,
+        weight_dtype,
+        train_unet,
+        noise,
+        timesteps,
+        sigmas,
+    ):
+        current_ip_state = None
+        reference_ip_state = getattr(self, "_reference_ip_adapter_state", None)
+        if reference_ip_state is not None:
+            current_ip_state = {key: value.detach().clone().cpu() for key, value in self.get_ip_adapter_state_dict(unet).items()}
+        current_network_state = None
+        reference_network_state = getattr(self, "_reference_network_state", None)
+        if reference_network_state is not None:
+            current_network_state = self.get_network_state_dict(network)
+        network_was_enabled = None
+        unet_was_training = unet.training
+        if reference_network_state is None and hasattr(network, "set_enabled"):
+            network_was_enabled = True
+            network.set_enabled(False)
+        try:
+            if reference_network_state is not None:
+                self.load_network_state_dict(network, reference_network_state)
+            if reference_ip_state is not None:
+                self.load_ip_adapter_state_dict(unet, reference_ip_state)
+            unet.eval()
+            with torch.no_grad():
+                ref_pred, ref_target, ref_timesteps, ref_weighting = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    latents,
+                    batch,
+                    text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    is_train=False,
+                    noise=noise,
+                    timesteps=timesteps,
+                    sigmas=sigmas,
+                    timesteps_are_scaled=True,
+                )
+        finally:
+            unet.train(unet_was_training)
+            if reference_ip_state is not None and current_ip_state is not None:
+                self.load_ip_adapter_state_dict(unet, current_ip_state)
+            if reference_network_state is not None and current_network_state is not None:
+                self.load_network_state_dict(network, current_network_state)
+            if network_was_enabled is not None:
+                network.set_enabled(True)
+        return ref_pred, ref_target, ref_timesteps, ref_weighting
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         if args.cache_text_encoder_outputs:
@@ -729,6 +837,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 grad_norm = getattr(self, "_last_ip_adapter_grad_norm", None)
             if grad_norm is not None:
                 logs["anima_ip_adapter/grad_norm"] = grad_norm
+        preference_loss = getattr(self, "_last_anima_preference_loss", None)
+        if preference_loss is not None:
+            logs["anima_preference/loss"] = preference_loss
+            logs["anima_preference/pairs"] = getattr(self, "_last_anima_preference_pairs", 0)
+            logs["anima_preference/implicit_acc"] = getattr(self, "_last_anima_preference_acc", 0.0)
+            logs["anima_preference/model_mse"] = getattr(self, "_last_anima_preference_model_mse", 0.0)
+            logs["anima_preference/ref_mse"] = getattr(self, "_last_anima_preference_ref_mse", 0.0)
         return logs
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
@@ -743,6 +858,59 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def encode_images_to_latents(self, args, vae, images):
         vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage
         return vae.encode_pixels_to_latents(images)  # Keep 4D for input/output
+
+    def encode_negative_images_to_latents(self, args, vae, batch, accelerator, vae_dtype, weight_dtype):
+        negative_image_paths = batch.get("negative_image_paths", None)
+        if negative_image_paths is None or not any(len(paths or []) > 0 for paths in negative_image_paths):
+            return None, None
+        if batch.get("images") is None:
+            return None, None
+
+        image_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]
+        )
+        negative_images = []
+        negative_indices = []
+        target_images = batch["images"]
+        for sample_index, paths in enumerate(negative_image_paths):
+            paths = [path for path in (paths or []) if path]
+            if not paths:
+                continue
+            target_image = target_images[sample_index]
+            target_h = int(target_image.shape[-2])
+            target_w = int(target_image.shape[-1])
+            negative_mode = getattr(args, "anima_preference_negative_mode", "random")
+            if negative_mode == "first":
+                selected_paths = paths[:1]
+            elif negative_mode == "all":
+                selected_paths = paths
+            elif negative_mode == "random":
+                selected_paths = [random.choice(paths)]
+            else:
+                raise ValueError(f"Unsupported --anima_preference_negative_mode: {negative_mode}")
+            for neg_path in selected_paths:
+                if not os.path.exists(neg_path):
+                    raise FileNotFoundError(f"Negative preference image not found: {neg_path}")
+                image = Image.fromarray(train_util.load_image(neg_path)[:, :, :3]).convert("RGB")
+                image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                negative_images.append(image_transform(image))
+                negative_indices.append(sample_index)
+
+        if not negative_images:
+            return None, None
+
+        images = torch.stack(negative_images).to(accelerator.device, dtype=vae_dtype)
+        with torch.no_grad():
+            latents = self.encode_images_to_latents(args, vae, images)
+            if torch.any(torch.isnan(latents)):
+                accelerator.print("NaN found in negative latents, replacing with zeros")
+                latents = torch.nan_to_num(latents, 0, out=latents)
+            latents = self.shift_scale_latents(args, latents).to(dtype=weight_dtype)
+        indices = torch.tensor(negative_indices, device=accelerator.device, dtype=torch.long)
+        return latents, indices
 
     def shift_scale_latents(self, args, latents):
         # Latents already normalized by vae.encode with scale
@@ -882,6 +1050,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         train_unet,
         is_train=True,
+        noise=None,
+        timesteps=None,
+        sigmas=None,
+        timesteps_are_scaled=False,
     ):
         anima: anima_models.Anima = unet
         self._current_unet_for_logging = accelerator.unwrap_model(unet)
@@ -889,13 +1061,19 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Sample noise
         if latents.ndim == 5:  # Fallback for 5D latents (old cache)
             latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
-        noise = torch.randn_like(latents)
+        if noise is None:
+            noise = torch.randn_like(latents)
 
         # Get noisy model input and timesteps
-        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
-        )
-        timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
+        if timesteps is None or sigmas is None:
+            noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            )
+        else:
+            sigma_view = sigmas.view(-1, 1, 1, 1) if latents.ndim == 4 else sigmas.view(-1, 1, 1, 1, 1)
+            noisy_model_input = ((1.0 - sigma_view) * latents + sigma_view * noise).to(weight_dtype)
+        if not timesteps_are_scaled:
+            timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
         # Gradient checkpointing support
         if args.gradient_checkpointing:
@@ -948,6 +1126,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+        self._last_noise_pred_inputs = {
+            "noise": noise.detach(),
+            "timesteps": timesteps.detach(),
+            "sigmas": sigmas.detach(),
+        }
 
         return model_pred, target, timesteps, weighting
 
@@ -986,6 +1169,207 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             batch["text_encoder_outputs_list"] = text_encoder_outputs_list + [caption_dropout_rates]
 
         self._current_vae = vae
+        if getattr(args, "anima_preference_training", False) and is_train:
+            with torch.no_grad():
+                if "latents" in batch and batch["latents"] is not None:
+                    latents = batch["latents"].to(accelerator.device)
+                else:
+                    if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
+                        latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                    else:
+                        chunks = [
+                            batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
+                        ]
+                        latents = torch.cat(
+                            [
+                                self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                                for chunk in chunks
+                            ],
+                            dim=0,
+                        )
+                    if torch.any(torch.isnan(latents)):
+                        accelerator.print("NaN found in latents, replacing with zeros")
+                        latents = torch.nan_to_num(latents, 0, out=latents)
+                latents = self.shift_scale_latents(args, latents)
+
+            text_encoder_conds = []
+            if text_encoder_outputs_list is not None:
+                text_encoder_conds = text_encoder_outputs_list
+
+            if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
+                with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
+                    if args.weighted_captions:
+                        input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids_list,
+                            weights_list,
+                        )
+                    else:
+                        input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                            tokenize_strategy,
+                            self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                            input_ids,
+                        )
+                    if args.full_fp16:
+                        encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+
+                if len(text_encoder_conds) == 0:
+                    text_encoder_conds = encoded_text_encoder_conds
+                else:
+                    for i in range(len(encoded_text_encoder_conds)):
+                        if encoded_text_encoder_conds[i] is not None:
+                            text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+            noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+            )
+
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+            if weighting is not None:
+                loss = loss * weighting
+            if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                loss = train_network.apply_masked_loss(loss, batch)
+            loss = loss.mean(dim=list(range(1, loss.ndim)))
+            loss_weights = batch["loss_weights"].to(loss.device)
+            loss = loss * loss_weights
+            pos_noise_inputs = self._last_noise_pred_inputs
+
+            negative_latents, negative_indices = self.encode_negative_images_to_latents(
+                args,
+                vae,
+                batch,
+                accelerator,
+                vae_dtype,
+                weight_dtype,
+            )
+            if negative_latents is not None and negative_indices is not None and negative_indices.numel() > 0:
+                selected_indices = negative_indices.detach().cpu().tolist()
+                neg_batch = dict(batch)
+                if batch.get("image_paths", None) is not None:
+                    # Keep conditioning identical for chosen/rejected. The rejected target is already in
+                    # negative_latents; image_paths are only used by self-reference fallback feature extraction.
+                    neg_batch["image_paths"] = [batch["image_paths"][sample_i] for sample_i in selected_indices]
+                if batch.get("reference_image_paths", None) is not None:
+                    neg_batch["reference_image_paths"] = [batch["reference_image_paths"][sample_i] for sample_i in selected_indices]
+                if batch.get("negative_image_paths", None) is not None:
+                    neg_batch["negative_image_paths"] = [batch["negative_image_paths"][sample_i] for sample_i in selected_indices]
+
+                neg_text_encoder_conds = [
+                    cond.index_select(0, negative_indices) if torch.is_tensor(cond) and cond.shape[0] == latents.shape[0] else cond
+                    for cond in text_encoder_conds
+                ]
+                chosen_latents = latents.index_select(0, negative_indices)
+                chosen_batch = dict(batch)
+                if batch.get("image_paths", None) is not None:
+                    chosen_batch["image_paths"] = [batch["image_paths"][sample_i] for sample_i in selected_indices]
+                if batch.get("reference_image_paths", None) is not None:
+                    chosen_batch["reference_image_paths"] = [batch["reference_image_paths"][sample_i] for sample_i in selected_indices]
+                if batch.get("negative_image_paths", None) is not None:
+                    chosen_batch["negative_image_paths"] = [batch["negative_image_paths"][sample_i] for sample_i in selected_indices]
+                chosen_text_encoder_conds = neg_text_encoder_conds
+                shared_noise = pos_noise_inputs["noise"].index_select(0, negative_indices)
+                shared_timesteps = pos_noise_inputs["timesteps"].index_select(0, negative_indices)
+                shared_sigmas = pos_noise_inputs["sigmas"].index_select(0, negative_indices)
+
+                pair_latents = torch.cat([chosen_latents, negative_latents], dim=0)
+                pair_noise = torch.cat([shared_noise, shared_noise], dim=0)
+                pair_timesteps = torch.cat([shared_timesteps, shared_timesteps], dim=0)
+                pair_sigmas = torch.cat([shared_sigmas, shared_sigmas], dim=0)
+                pair_batch = dict(chosen_batch)
+                if chosen_batch.get("image_paths", None) is not None and neg_batch.get("image_paths", None) is not None:
+                    pair_batch["image_paths"] = chosen_batch["image_paths"] + neg_batch["image_paths"]
+                if chosen_batch.get("reference_image_paths", None) is not None and neg_batch.get("reference_image_paths", None) is not None:
+                    pair_batch["reference_image_paths"] = chosen_batch["reference_image_paths"] + neg_batch["reference_image_paths"]
+                if chosen_batch.get("negative_image_paths", None) is not None and neg_batch.get("negative_image_paths", None) is not None:
+                    pair_batch["negative_image_paths"] = chosen_batch["negative_image_paths"] + neg_batch["negative_image_paths"]
+                pair_count = int(negative_indices.numel())
+                pair_text_encoder_conds = [
+                    torch.cat([cond, cond], dim=0) if torch.is_tensor(cond) and cond.shape[0] == pair_count else cond
+                    for cond in chosen_text_encoder_conds
+                ]
+
+                pair_noise_pred, pair_target, pair_timesteps_out, pair_weighting = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    pair_latents,
+                    pair_batch,
+                    pair_text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    is_train=is_train,
+                    noise=pair_noise,
+                    timesteps=pair_timesteps,
+                    sigmas=pair_sigmas,
+                    timesteps_are_scaled=True,
+                )
+                pair_huber_c = train_util.get_huber_threshold_if_needed(args, pair_timesteps_out, noise_scheduler)
+                pair_loss = train_util.conditional_loss(
+                    pair_noise_pred.float(), pair_target.float(), args.loss_type, "none", pair_huber_c
+                )
+                if pair_weighting is not None:
+                    pair_loss = pair_loss * pair_weighting
+                pair_loss = pair_loss.mean(dim=list(range(1, pair_loss.ndim)))
+                chosen_loss, neg_loss = pair_loss.chunk(2)
+
+                ref_pair_pred, ref_pair_target, ref_pair_timesteps, ref_pair_weighting = self.get_reference_policy_predictions(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    pair_latents,
+                    pair_batch,
+                    pair_text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    noise=pair_noise,
+                    timesteps=pair_timesteps,
+                    sigmas=pair_sigmas,
+                )
+                ref_pair_huber_c = train_util.get_huber_threshold_if_needed(args, ref_pair_timesteps, noise_scheduler)
+                ref_pair_loss = train_util.conditional_loss(
+                    ref_pair_pred.float(), ref_pair_target.float(), args.loss_type, "none", ref_pair_huber_c
+                )
+                if ref_pair_weighting is not None:
+                    ref_pair_loss = ref_pair_loss * ref_pair_weighting
+                ref_pair_loss = ref_pair_loss.mean(dim=list(range(1, ref_pair_loss.ndim)))
+                ref_chosen_loss, ref_neg_loss = ref_pair_loss.chunk(2)
+
+                model_diff = chosen_loss - neg_loss
+                ref_diff = ref_chosen_loss - ref_neg_loss
+                inside_term = -0.5 * args.anima_preference_beta * (model_diff - ref_diff)
+                preference_loss = -torch.nn.functional.logsigmoid(inside_term).mean()
+                self._last_anima_preference_loss = preference_loss.detach().float().item()
+                self._last_anima_preference_pairs = int(negative_indices.numel())
+                self._last_anima_preference_acc = (inside_term > 0).float().mean().detach().item()
+                self._last_anima_preference_model_mse = 0.5 * (chosen_loss.mean() + neg_loss.mean()).detach().item()
+                self._last_anima_preference_ref_mse = 0.5 * (ref_chosen_loss.mean() + ref_neg_loss.mean()).detach().item()
+                loss = args.anima_preference_weight * preference_loss
+            else:
+                self._last_anima_preference_loss = None
+                self._last_anima_preference_pairs = 0
+                loss = loss.sum() * 0.0
+
+            loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+            return loss.mean()
+
         return super().process_batch(
             batch,
             text_encoders,
@@ -1018,6 +1402,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_timestep_sampling"] = args.timestep_sampling
         metadata["ss_sigmoid_scale"] = args.sigmoid_scale
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
+        metadata["ss_anima_preference_training"] = str(getattr(args, "anima_preference_training", False))
+        if getattr(args, "anima_preference_training", False):
+            metadata["ss_anima_preference_beta"] = str(args.anima_preference_beta)
+            metadata["ss_anima_preference_weight"] = str(args.anima_preference_weight)
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)

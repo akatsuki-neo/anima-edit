@@ -711,6 +711,9 @@ class NetworkTrainer:
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
+        if hasattr(self, "capture_reference_policy_state"):
+            self.capture_reference_policy_state(args, network, unet)
+
         if args.gradient_checkpointing:
             if args.cpu_offload_checkpointing:
                 unet.enable_gradient_checkpointing(cpu_offload=True)
@@ -979,6 +982,9 @@ class NetworkTrainer:
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
 
         # epoch数を計算する
+        if hasattr(self, "capture_reference_policy_state"):
+            self.capture_reference_policy_state(args, accelerator.unwrap_model(network), accelerator.unwrap_model(unet))
+
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
         if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):

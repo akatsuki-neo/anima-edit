@@ -188,6 +188,7 @@ class ImageInfo:
         absolute_path: str,
         caption_dropout_rate: float = 0.0,
         reference_image_paths: Optional[List[str]] = None,
+        negative_image_paths: Optional[List[str]] = None,
     ) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
@@ -196,6 +197,7 @@ class ImageInfo:
         self.absolute_path: str = absolute_path
         self.caption_dropout_rate: float = caption_dropout_rate
         self.reference_image_paths: List[str] = reference_image_paths or []
+        self.negative_image_paths: List[str] = negative_image_paths or []
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
         self.bucket_reso: Tuple[int, int] = None
@@ -1815,6 +1817,9 @@ class BaseDataset(torch.utils.data.Dataset):
         example["reference_image_paths"] = [
             self.image_data[image_key].reference_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
         ]
+        example["negative_image_paths"] = [
+            self.image_data[image_key].negative_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
+        ]
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
@@ -2216,12 +2221,15 @@ class DreamBoothDataset(BaseDataset):
 
             img_paths, captions, sizes = load_dreambooth_dir(subset)
             ref_paths_by_target = {}
+            neg_paths_by_target = {}
             if len(img_paths) > 0:
                 ref_suffix_pattern = re.compile(r"_ref\d*$")
+                neg_suffix_pattern = re.compile(r"_neg\d*$")
                 target_paths_by_stem = {
                     os.path.splitext(path)[0]: path
                     for path in img_paths
                     if ref_suffix_pattern.search(os.path.splitext(path)[0]) is None
+                    and neg_suffix_pattern.search(os.path.splitext(path)[0]) is None
                 }
                 filtered_img_paths = []
                 filtered_captions = []
@@ -2234,11 +2242,21 @@ class DreamBoothDataset(BaseDataset):
                         if target_path is not None:
                             ref_paths_by_target.setdefault(target_path, []).append(img_path)
                             continue
+                    neg_match = neg_suffix_pattern.search(stem)
+                    if neg_match is not None:
+                        target_path = target_paths_by_stem.get(stem[: neg_match.start()])
+                        if target_path is not None:
+                            neg_paths_by_target.setdefault(target_path, []).append(img_path)
+                            continue
                     filtered_img_paths.append(img_path)
                     filtered_captions.append(caption)
                     filtered_sizes.append(size)
                 if len(filtered_img_paths) < len(img_paths):
-                    logger.info(f"found {len(img_paths) - len(filtered_img_paths)} *_ref images as reference images in {subset.image_dir}")
+                    logger.info(
+                        f"found {sum(len(paths) for paths in ref_paths_by_target.values())} *_ref images as reference images "
+                        f"and {sum(len(paths) for paths in neg_paths_by_target.values())} *_neg images as negative preference images "
+                        f"in {subset.image_dir}"
+                    )
                 def ref_sort_key(path):
                     stem = os.path.splitext(path)[0]
                     match = ref_suffix_pattern.search(stem)
@@ -2250,6 +2268,17 @@ class DreamBoothDataset(BaseDataset):
 
                 for ref_paths in ref_paths_by_target.values():
                     ref_paths.sort(key=ref_sort_key)
+                def neg_sort_key(path):
+                    stem = os.path.splitext(path)[0]
+                    match = neg_suffix_pattern.search(stem)
+                    if match is None:
+                        return (stem, 0)
+                    suffix = match.group(0)
+                    neg_index = int(suffix[4:]) if len(suffix) > 4 else 0
+                    return (stem[: match.start()], neg_index, path)
+
+                for neg_paths in neg_paths_by_target.values():
+                    neg_paths.sort(key=neg_sort_key)
                 img_paths, captions, sizes = filtered_img_paths, filtered_captions, filtered_sizes
             if len(img_paths) < 1:
                 logger.warning(
@@ -2271,6 +2300,7 @@ class DreamBoothDataset(BaseDataset):
                     img_path,
                     subset.caption_dropout_rate,
                     reference_image_paths=ref_paths_by_target.get(img_path, []),
+                    negative_image_paths=neg_paths_by_target.get(img_path, []),
                 )
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
@@ -2504,6 +2534,20 @@ class FineTuningDataset(BaseDataset):
                         for ref_path in reference_image_paths
                     ]
 
+                negative_image_paths = img_md.get("negative_image_paths")
+                if negative_image_paths is None:
+                    negative_image_paths = img_md.get("negative_images", img_md.get("negs", []))
+                if isinstance(negative_image_paths, str):
+                    negative_image_paths = [negative_image_paths]
+                if negative_image_paths is None:
+                    negative_image_paths = []
+                if len(negative_image_paths) > 0:
+                    metadata_dir = os.path.dirname(os.path.abspath(subset.metadata_file))
+                    negative_image_paths = [
+                        neg_path if os.path.isabs(neg_path) else os.path.normpath(os.path.join(metadata_dir, neg_path))
+                        for neg_path in negative_image_paths
+                    ]
+
                 image_info = ImageInfo(
                     image_key,
                     subset.num_repeats,
@@ -2512,6 +2556,7 @@ class FineTuningDataset(BaseDataset):
                     abs_path,
                     subset.caption_dropout_rate,
                     reference_image_paths=reference_image_paths,
+                    negative_image_paths=negative_image_paths,
                 )
                 image_info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation

@@ -418,6 +418,30 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         default=4,
         help="Maximum number of reference images to sample when using --anima_sample_reference_dir. Default: 4",
     )
+    parser.add_argument(
+        "--anima_preference_training",
+        action="store_true",
+        help="Enable DPO-style preference training using *_neg, *_neg1, ... images paired with each target.",
+    )
+    parser.add_argument(
+        "--anima_preference_beta",
+        type=float,
+        default=1000.0,
+        help="Beta scale for Anima preference loss: -logsigmoid(beta * (negative_mse - positive_mse)).",
+    )
+    parser.add_argument(
+        "--anima_preference_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the Anima preference loss added to the normal diffusion MSE loss.",
+    )
+    parser.add_argument(
+        "--anima_preference_negative_mode",
+        type=str,
+        default="random",
+        choices=["random", "all", "first"],
+        help="How to use multiple *_neg images per target for preference training: random samples one per step, all expands every negative into a pair, first keeps the old behavior.",
+    )
 
 
 # Loss weighting
