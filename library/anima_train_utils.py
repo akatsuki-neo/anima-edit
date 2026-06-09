@@ -766,12 +766,14 @@ def _load_reference_sample_prompts(sample_reference_dir: str, max_references: in
             # *_ref / *_ref1 / *_ref2 images as standalone sample prompts.
             image_by_stem.setdefault(stem_name, path)
 
-        for stem_name in sorted(image_by_stem):
+        sample_stems = set(image_by_stem)
+        sample_stems.update(txt_by_stem)
+        for stem_name in sorted(sample_stems):
             if ref_suffix_re.search(stem_name):
                 continue
-            image_path = image_by_stem[stem_name]
+            image_path = image_by_stem.get(stem_name)
             txt_path = txt_by_stem.get(stem_name)
-            if txt_path is None:
+            if txt_path is None and image_path is not None:
                 txt_path = os.path.splitext(image_path)[0] + ".txt"
             if not os.path.isfile(txt_path):
                 continue
@@ -791,11 +793,13 @@ def _load_reference_sample_prompts(sample_reference_dir: str, max_references: in
                     break
                 ref_paths.append(ref_path)
                 ref_index += 1
+            if image_path is None and not ref_paths:
+                continue
 
             ref_key = tuple(os.path.normcase(os.path.abspath(path)) for path in (ref_paths or [image_path]))
             prompt_key = (ref_key, prompt)
             if prompt_key in seen_targets:
-                logger.warning(f"Skipping duplicate Anima sample prompt: {image_path}")
+                logger.warning(f"Skipping duplicate Anima sample prompt: {txt_path}")
                 continue
             seen_targets.add(prompt_key)
             prompts.append({"prompt": prompt, "image": ref_paths or image_path})
