@@ -62,7 +62,16 @@ lokr:
 --network_args "factor=4" \
 ```
 
-就看你喜欢挂什么, 我个人感觉没啥区别（
+## LoRA vs LoKr 效果对比（LoRA rank=128 / LoKr full f4，宽幅图像测试）
+| 组别 | LoRA(r128) 样图 | LoKr(full f4) 样图 |
+| ---- | --------------- | ------------------ |
+| 第1组 | ![lora1](imgs/lora_r128_1.png) | ![lokr1](imgs/lokr_full_f4_1.png) |
+| 第2组 | ![lora2](imgs/lora_r128_2.png) | ![lokr2](imgs/lokr_full_f4_2.png) |
+
+实验结论：根据两组宽幅图像测试结果，同等条件下 LoRA(r128) 生成效果明显优于 LoKr(full f4)
+
+> 测试参数说明：LoRA rank=128，LoKr 全矩阵 f4，测试素材均为宽幅长图
+> 结论：实测两组样本下 LoRA 整体表现优于 LoKr
 
 # 还有一点采样
 众所周知我们训练会开wandb
