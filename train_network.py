@@ -495,7 +495,8 @@ class NetworkTrainer:
         setup_logging(args, reset=True)
 
         cache_latents = args.cache_latents
-        use_dreambooth_method = args.in_json is None
+        use_spawner_jsonl_pairs = getattr(args, "spawner_jsonl_pairs", None) is not None
+        use_dreambooth_method = args.in_json is None and not use_spawner_jsonl_pairs
         use_user_config = args.dataset_config is not None
 
         if args.seed is None:
@@ -516,7 +517,7 @@ class NetworkTrainer:
             if use_user_config:
                 logger.info(f"Loading dataset config from {args.dataset_config}")
                 user_config = config_util.load_user_config(args.dataset_config)
-                ignored = ["train_data_dir", "reg_data_dir", "in_json"]
+                ignored = ["train_data_dir", "reg_data_dir", "in_json", "spawner_jsonl_pairs"]
                 if any(getattr(args, attr) is not None for attr in ignored):
                     logger.warning(
                         "ignoring the following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
@@ -543,7 +544,8 @@ class NetworkTrainer:
                                 "subsets": [
                                     {
                                         "image_dir": args.train_data_dir,
-                                        "metadata_file": args.in_json,
+                                        "metadata_file": args.spawner_jsonl_pairs if use_spawner_jsonl_pairs else args.in_json,
+                                        "spawner_jsonl_pairs": use_spawner_jsonl_pairs,
                                     }
                                 ]
                             }
