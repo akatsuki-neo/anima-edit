@@ -62,7 +62,7 @@ lokr:
 --network_args "factor=4" \
 ```
 
-## LoRA vs LoKr 效果对比（LoRA rank=128 / LoKr full f4，宽幅图像测试）
+## LoRA vs LoKr 效果对比（LoRA rank=128 / LoKr full f4）
 | 组别 | LoRA(r128) 样图 | LoKr(full f4) 样图 |
 | ---- | --------------- | ------------------ |
 | 第1组 | ![lora1](imgs/lora_r128_1.png) | ![lokr1](imgs/lokr_full_f4_1.png) |
