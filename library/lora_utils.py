@@ -131,22 +131,32 @@ def load_safetensors_with_lora_and_fp8(
                     down_key = lora_name + ".lora_down.weight"
                     up_key = lora_name + ".lora_up.weight"
                     alpha_key = lora_name + ".alpha"
+                    dora_magnitude_key = lora_name + ".dora_magnitude"
+                    dora_scale_key = lora_name + ".dora_scale"
                     if down_key in lora_weight_keys and up_key in lora_weight_keys:
                         found = True
                         break
 
                 if found:
-                    # Standard LoRA merge
+                    # Standard LoRA merge, or DoRA merge when a magnitude vector is present.
                     # get LoRA weights
                     down_weight = lora_sd[down_key]
                     up_weight = lora_sd[up_key]
+                    dora_magnitude = lora_sd.get(dora_magnitude_key, None)
+                    comfy_dora_scale = lora_sd.get(dora_scale_key, None)
 
                     dim = down_weight.size()[0]
                     alpha = lora_sd.get(alpha_key, dim)
+                    if isinstance(alpha, torch.Tensor):
+                        alpha = alpha.detach().float().item()
                     scale = alpha / dim
 
                     down_weight = down_weight.to(calc_device)
                     up_weight = up_weight.to(calc_device)
+                    if dora_magnitude is not None:
+                        dora_magnitude = dora_magnitude.to(calc_device)
+                    if comfy_dora_scale is not None:
+                        comfy_dora_scale = comfy_dora_scale.to(calc_device)
 
                     original_dtype = model_weight.dtype
                     if original_dtype.itemsize == 1:  # fp8
@@ -155,26 +165,38 @@ def load_safetensors_with_lora_and_fp8(
                         down_weight = down_weight.to(torch.float16)
                         up_weight = up_weight.to(torch.float16)
 
-                    # W <- W + U * D
+                    # W <- W + U * D, or weight-decomposed DoRA if a scale/magnitude vector is present.
                     if len(model_weight.size()) == 2:
                         # linear
                         if len(up_weight.size()) == 4:  # use linear projection mismatch
                             up_weight = up_weight.squeeze(3).squeeze(2)
                             down_weight = down_weight.squeeze(3).squeeze(2)
-                        model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
+                        delta_weight = (up_weight @ down_weight) * scale
                     elif down_weight.size()[2:4] == (1, 1):
                         # conv2d 1x1
-                        model_weight = (
-                            model_weight
-                            + multiplier
-                            * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        delta_weight = (
+                            (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
                             * scale
                         )
                     else:
                         # conv2d 3x3
                         conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
                         # logger.info(conved.size(), weight.size(), module.stride, module.padding)
-                        model_weight = model_weight + multiplier * conved * scale
+                        delta_weight = conved * scale
+
+                    if comfy_dora_scale is not None:
+                        direction = model_weight.float() + delta_weight.float()
+                        org_norm = torch.linalg.vector_norm(model_weight.float().flatten(1), dim=1).clamp_min(1e-6)
+                        dora = comfy_dora_scale.float().reshape(direction.shape[0], -1)[:, 0]
+                        merged = direction * (dora / org_norm).view(-1, *([1] * (direction.dim() - 1)))
+                        model_weight = model_weight.float() + float(multiplier) * (merged - model_weight.float())
+                    elif dora_magnitude is None:
+                        model_weight = model_weight + multiplier * delta_weight
+                    else:
+                        direction = model_weight.float() + multiplier * delta_weight.float()
+                        norm = torch.linalg.vector_norm(direction.flatten(1), dim=1).clamp_min(1e-6)
+                        dora_scale = dora_magnitude.float().flatten() / norm
+                        model_weight = direction * dora_scale.view(-1, *([1] * (direction.dim() - 1)))
 
                     if original_dtype.itemsize == 1:  # fp8
                         model_weight = model_weight.to(original_dtype)  # convert back to original dtype
@@ -184,6 +206,10 @@ def load_safetensors_with_lora_and_fp8(
                     lora_weight_keys.remove(up_key)
                     if alpha_key in lora_weight_keys:
                         lora_weight_keys.remove(alpha_key)
+                    if dora_magnitude_key in lora_weight_keys:
+                        lora_weight_keys.remove(dora_magnitude_key)
+                    if dora_scale_key in lora_weight_keys:
+                        lora_weight_keys.remove(dora_scale_key)
                     continue
 
                 # Check for LoHa/LoKr weights with same prefix search

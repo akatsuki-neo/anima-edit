@@ -73,6 +73,13 @@ lokr:
 > 测试参数说明：LoRA rank=128，LoKr 全矩阵 f4
 > 结论：实测两组样本下 LoRA 整体表现优于 LoKr
 
+我在仓库里面支持了训练dora，不过我还没测过
+```bash
+--network_module networks.dora \
+--network_dim 128 \
+--network_alpha 128 \
+```
+
 # 还有一点采样
 众所周知我们训练会开wandb
 ```bash
