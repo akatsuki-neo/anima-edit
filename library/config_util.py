@@ -92,6 +92,7 @@ class FineTuningSubsetParams(BaseSubsetParams):
     metadata_file: Optional[str] = None
     alpha_mask: bool = False
     spawner_jsonl_pairs: bool = False
+    spawner_jsonl_skip_missing: bool = False
 
 
 @dataclass
@@ -225,6 +226,7 @@ class ConfigSanitizer:
         "image_dir": str,
         "alpha_mask": bool,
         "spawner_jsonl_pairs": bool,
+        "spawner_jsonl_skip_missing": bool,
     }
     CN_SUBSET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
@@ -584,6 +586,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     info += indent(dedent(f"""\
                         metadata_file: {subset.metadata_file}
                         spawner_jsonl_pairs: {subset.spawner_jsonl_pairs}
+                        spawner_jsonl_skip_missing: {subset.spawner_jsonl_skip_missing}
                     \n"""), "    ")
 
         logger.info(info)
