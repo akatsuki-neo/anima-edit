@@ -561,7 +561,6 @@ class FineTuningSubset(BaseSubset):
         image_dir,
         metadata_file: str,
         alpha_mask: bool,
-        spawner_jsonl_pairs: bool,
         num_repeats,
         shuffle_caption,
         caption_separator,
@@ -584,6 +583,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        spawner_jsonl_pairs: bool = False,
+        spawner_jsonl_skip_missing: bool = False,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -616,6 +617,7 @@ class FineTuningSubset(BaseSubset):
 
         self.metadata_file = metadata_file
         self.spawner_jsonl_pairs = spawner_jsonl_pairs
+        self.spawner_jsonl_skip_missing = spawner_jsonl_skip_missing
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, FineTuningSubset):
@@ -2360,13 +2362,19 @@ def _resolve_spawner_jsonl_path(root_dir: str, path: str) -> str:
     return os.path.normpath(os.path.join(root_dir, path))
 
 
-def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str) -> Dict[str, Dict[str, Any]]:
+def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: bool = False) -> Dict[str, Dict[str, Any]]:
     if image_dir is None:
         raise ValueError("--train_data_dir/image_dir is required for spawner jsonl pairs")
 
     root_dir = os.path.abspath(image_dir)
     metadata: Dict[str, Dict[str, Any]] = {}
     missing_size = 0
+    missing_paths: List[str] = []
+    missing_path_count = 0
+    skipped_missing_entries = 0
+    duplicate_output_count = 0
+    duplicate_output_examples: List[str] = []
+    seen_output_paths: Dict[str, int] = {}
 
     with open(metadata_file, "rt", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -2388,8 +2396,22 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str) -> Dict[str, D
 
             output_path = _resolve_spawner_jsonl_path(root_dir, output_image)
             input_path = _resolve_spawner_jsonl_path(root_dir, input_image)
+            row_missing_paths = []
+            if not os.path.exists(output_path):
+                row_missing_paths.append(f"line {line_no} output_image: {output_image} -> {output_path}")
+            if not os.path.exists(input_path):
+                row_missing_paths.append(f"line {line_no} local_input_image: {input_image} -> {input_path}")
+
+            if row_missing_paths:
+                missing_path_count += len(row_missing_paths)
+                if len(missing_paths) < 20:
+                    missing_paths.extend(row_missing_paths[: 20 - len(missing_paths)])
+                if skip_missing:
+                    skipped_missing_entries += 1
+                    continue
 
             image_md: Dict[str, Any] = {
+                "abs_path": output_path,
                 "caption": line_md.get("summarized_text") or line_md.get("text") or "",
                 "reference_image_paths": [input_path],
             }
@@ -2406,9 +2428,38 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str) -> Dict[str, D
             if input_width is not None and input_height is not None:
                 image_md["reference_image_sizes"] = [[int(input_width), int(input_height)]]
 
-            if output_path in metadata:
-                logger.warning(f"duplicate output_image in spawner jsonl, later line overwrites earlier entry: {output_image}")
-            metadata[output_path] = image_md
+            output_seen_count = seen_output_paths.get(output_path, 0)
+            seen_output_paths[output_path] = output_seen_count + 1
+            if output_seen_count == 0:
+                image_key = output_path
+            else:
+                duplicate_output_count += 1
+                if len(duplicate_output_examples) < 5:
+                    duplicate_output_examples.append(f"line {line_no}: {output_image}")
+                image_key = f"{output_path}#spawner_line_{line_no}"
+            metadata[image_key] = image_md
+
+    if missing_path_count > 0 and not skip_missing:
+        preview = "\n".join(missing_paths)
+        remaining = missing_path_count - len(missing_paths)
+        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        raise FileNotFoundError(
+            "spawner jsonl references missing image files after resolving paths relative to "
+            f"train_data_dir/image_dir={root_dir}:\n{preview}{suffix}"
+        )
+    if skipped_missing_entries > 0:
+        preview = "\n".join(missing_paths)
+        remaining = missing_path_count - len(missing_paths)
+        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        logger.warning(
+            f"skipped {skipped_missing_entries} spawner jsonl entries with missing image files. examples:\n{preview}{suffix}"
+        )
+    if duplicate_output_count > 0:
+        examples = "; ".join(duplicate_output_examples)
+        logger.warning(
+            f"spawner jsonl contains {duplicate_output_count} duplicate output_image entries; "
+            f"keeping them as separate samples. examples: {examples}"
+        )
 
     logger.info(f"loaded spawner jsonl pairs: {len(metadata)} entries from {metadata_file}")
     if missing_size > 0:
@@ -2484,7 +2535,9 @@ class FineTuningDataset(BaseDataset):
             if os.path.exists(subset.metadata_file):
                 if getattr(subset, "spawner_jsonl_pairs", False):
                     logger.info(f"loading spawner jsonl pairs metadata: {subset.metadata_file}")
-                    metadata = _load_spawner_jsonl_pairs(subset.metadata_file, subset.image_dir)
+                    metadata = _load_spawner_jsonl_pairs(
+                        subset.metadata_file, subset.image_dir, getattr(subset, "spawner_jsonl_skip_missing", False)
+                    )
                 elif subset.metadata_file.endswith(".jsonl"):
                     logger.info(f"loading existing JSOL metadata: {subset.metadata_file}")
                     # optional JSONL format
@@ -2518,7 +2571,17 @@ class FineTuningDataset(BaseDataset):
             if subset.image_dir is not None:
                 image_dirs.add(subset.image_dir)
             for image_key in metadata.keys():
-                if not os.path.isabs(image_key):
+                explicit_abs_path = metadata[image_key].get("abs_path")
+                if explicit_abs_path is not None:
+                    if not os.path.isabs(explicit_abs_path):
+                        assert (
+                            subset.image_dir is not None
+                        ), f"image_dir is required when abs_path is relative / abs_pathが相対パスの場合、image_dirの指定が必要です: {explicit_abs_path}"
+                        abs_path = os.path.join(subset.image_dir, explicit_abs_path)
+                    else:
+                        abs_path = explicit_abs_path
+                    image_dirs.add(os.path.dirname(abs_path))
+                elif not os.path.isabs(image_key):
                     assert (
                         subset.image_dir is not None
                     ), f"image_dir is required when image paths are relative / 画像パスが相対パスの場合、image_dirの指定が必要です: {image_key}"
@@ -5021,6 +5084,11 @@ def add_dataset_arguments(
                 "spawner-style jsonl for paired edit training. Paths in local_input_image and output_image are resolved "
                 "relative to train_data_dir; summarized_text is used as caption."
             ),
+        )
+        parser.add_argument(
+            "--spawner_jsonl_skip_missing",
+            action="store_true",
+            help="skip spawner jsonl entries whose local_input_image or output_image files do not exist",
         )
         parser.add_argument(
             "--dataset_repeats",
