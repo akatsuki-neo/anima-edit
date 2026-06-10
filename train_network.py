@@ -546,6 +546,7 @@ class NetworkTrainer:
                                         "image_dir": args.train_data_dir,
                                         "metadata_file": args.spawner_jsonl_pairs if use_spawner_jsonl_pairs else args.in_json,
                                         "spawner_jsonl_pairs": use_spawner_jsonl_pairs,
+                                        "spawner_jsonl_skip_missing": getattr(args, "spawner_jsonl_skip_missing", False),
                                     }
                                 ]
                             }
