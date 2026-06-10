@@ -188,6 +188,7 @@ class ImageInfo:
         absolute_path: str,
         caption_dropout_rate: float = 0.0,
         reference_image_paths: Optional[List[str]] = None,
+        reference_image_sizes: Optional[List[Tuple[int, int]]] = None,
         negative_image_paths: Optional[List[str]] = None,
     ) -> None:
         self.image_key: str = image_key
@@ -197,6 +198,7 @@ class ImageInfo:
         self.absolute_path: str = absolute_path
         self.caption_dropout_rate: float = caption_dropout_rate
         self.reference_image_paths: List[str] = reference_image_paths or []
+        self.reference_image_sizes: List[Tuple[int, int]] = reference_image_sizes or []
         self.negative_image_paths: List[str] = negative_image_paths or []
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
@@ -581,6 +583,8 @@ class FineTuningSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        spawner_jsonl_pairs: bool = False,
+        spawner_jsonl_skip_missing: bool = False,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -612,6 +616,8 @@ class FineTuningSubset(BaseSubset):
         )
 
         self.metadata_file = metadata_file
+        self.spawner_jsonl_pairs = spawner_jsonl_pairs
+        self.spawner_jsonl_skip_missing = spawner_jsonl_skip_missing
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, FineTuningSubset):
@@ -1817,6 +1823,9 @@ class BaseDataset(torch.utils.data.Dataset):
         example["reference_image_paths"] = [
             self.image_data[image_key].reference_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
         ]
+        example["reference_image_sizes"] = [
+            self.image_data[image_key].reference_image_sizes for image_key in bucket[image_index : image_index + bucket_batch_size]
+        ]
         example["negative_image_paths"] = [
             self.image_data[image_key].negative_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
         ]
@@ -2345,6 +2354,120 @@ class DreamBoothDataset(BaseDataset):
         self.num_reg_images = num_reg_images
 
 
+def _resolve_spawner_jsonl_path(root_dir: str, path: str) -> str:
+    if path is None or path == "":
+        return path
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(root_dir, path))
+
+
+def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: bool = False) -> Dict[str, Dict[str, Any]]:
+    if image_dir is None:
+        raise ValueError("--train_data_dir/image_dir is required for spawner jsonl pairs")
+
+    root_dir = os.path.abspath(image_dir)
+    metadata: Dict[str, Dict[str, Any]] = {}
+    missing_size = 0
+    missing_paths: List[str] = []
+    missing_path_count = 0
+    skipped_missing_entries = 0
+    duplicate_output_count = 0
+    duplicate_output_examples: List[str] = []
+    seen_output_paths: Dict[str, int] = {}
+
+    with open(metadata_file, "rt", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                line_md = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"invalid JSON in spawner jsonl at line {line_no}: {e}") from e
+
+            input_image = line_md.get("local_input_image")
+            output_image = line_md.get("output_image")
+            if not input_image or not output_image:
+                raise ValueError(
+                    f"spawner jsonl line {line_no} must contain non-empty local_input_image and output_image fields"
+                )
+
+            output_path = _resolve_spawner_jsonl_path(root_dir, output_image)
+            input_path = _resolve_spawner_jsonl_path(root_dir, input_image)
+            row_missing_paths = []
+            if not os.path.exists(output_path):
+                row_missing_paths.append(f"line {line_no} output_image: {output_image} -> {output_path}")
+            if not os.path.exists(input_path):
+                row_missing_paths.append(f"line {line_no} local_input_image: {input_image} -> {input_path}")
+
+            if row_missing_paths:
+                missing_path_count += len(row_missing_paths)
+                if len(missing_paths) < 20:
+                    missing_paths.extend(row_missing_paths[: 20 - len(missing_paths)])
+                if skip_missing:
+                    skipped_missing_entries += 1
+                    continue
+
+            image_md: Dict[str, Any] = {
+                "abs_path": output_path,
+                "caption": line_md.get("summarized_text") or line_md.get("text") or "",
+                "reference_image_paths": [input_path],
+            }
+
+            output_width = line_md.get("output_image_width")
+            output_height = line_md.get("output_image_height")
+            if output_width is not None and output_height is not None:
+                image_md["image_size"] = [int(output_width), int(output_height)]
+            else:
+                missing_size += 1
+
+            input_width = line_md.get("input_image_width")
+            input_height = line_md.get("input_image_height")
+            if input_width is not None and input_height is not None:
+                image_md["reference_image_sizes"] = [[int(input_width), int(input_height)]]
+
+            output_seen_count = seen_output_paths.get(output_path, 0)
+            seen_output_paths[output_path] = output_seen_count + 1
+            if output_seen_count == 0:
+                image_key = output_path
+            else:
+                duplicate_output_count += 1
+                if len(duplicate_output_examples) < 5:
+                    duplicate_output_examples.append(f"line {line_no}: {output_image}")
+                image_key = f"{output_path}#spawner_line_{line_no}"
+            metadata[image_key] = image_md
+
+    if missing_path_count > 0 and not skip_missing:
+        preview = "\n".join(missing_paths)
+        remaining = missing_path_count - len(missing_paths)
+        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        raise FileNotFoundError(
+            "spawner jsonl references missing image files after resolving paths relative to "
+            f"train_data_dir/image_dir={root_dir}:\n{preview}{suffix}"
+        )
+    if skipped_missing_entries > 0:
+        preview = "\n".join(missing_paths)
+        remaining = missing_path_count - len(missing_paths)
+        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        logger.warning(
+            f"skipped {skipped_missing_entries} spawner jsonl entries with missing image files. examples:\n{preview}{suffix}"
+        )
+    if duplicate_output_count > 0:
+        examples = "; ".join(duplicate_output_examples)
+        logger.warning(
+            f"spawner jsonl contains {duplicate_output_count} duplicate output_image entries; "
+            f"keeping them as separate samples. examples: {examples}"
+        )
+
+    logger.info(f"loaded spawner jsonl pairs: {len(metadata)} entries from {metadata_file}")
+    if missing_size > 0:
+        logger.info(f"spawner jsonl entries without output image size: {missing_size}; image files will be opened to get size")
+
+    return metadata
+
+
 class FineTuningDataset(BaseDataset):
     def __init__(
         self,
@@ -2410,7 +2533,12 @@ class FineTuningDataset(BaseDataset):
 
             # メタデータを読み込む
             if os.path.exists(subset.metadata_file):
-                if subset.metadata_file.endswith(".jsonl"):
+                if getattr(subset, "spawner_jsonl_pairs", False):
+                    logger.info(f"loading spawner jsonl pairs metadata: {subset.metadata_file}")
+                    metadata = _load_spawner_jsonl_pairs(
+                        subset.metadata_file, subset.image_dir, getattr(subset, "spawner_jsonl_skip_missing", False)
+                    )
+                elif subset.metadata_file.endswith(".jsonl"):
                     logger.info(f"loading existing JSOL metadata: {subset.metadata_file}")
                     # optional JSONL format
                     # {"image_path": "/path/to/image1.jpg", "caption": "A caption for image1", "image_size": [width, height]}
@@ -2443,7 +2571,17 @@ class FineTuningDataset(BaseDataset):
             if subset.image_dir is not None:
                 image_dirs.add(subset.image_dir)
             for image_key in metadata.keys():
-                if not os.path.isabs(image_key):
+                explicit_abs_path = metadata[image_key].get("abs_path")
+                if explicit_abs_path is not None:
+                    if not os.path.isabs(explicit_abs_path):
+                        assert (
+                            subset.image_dir is not None
+                        ), f"image_dir is required when abs_path is relative / abs_pathが相対パスの場合、image_dirの指定が必要です: {explicit_abs_path}"
+                        abs_path = os.path.join(subset.image_dir, explicit_abs_path)
+                    else:
+                        abs_path = explicit_abs_path
+                    image_dirs.add(os.path.dirname(abs_path))
+                elif not os.path.isabs(image_key):
                     assert (
                         subset.image_dir is not None
                     ), f"image_dir is required when image paths are relative / 画像パスが相対パスの場合、image_dirの指定が必要です: {image_key}"
@@ -2533,6 +2671,10 @@ class FineTuningDataset(BaseDataset):
                         ref_path if os.path.isabs(ref_path) else os.path.normpath(os.path.join(metadata_dir, ref_path))
                         for ref_path in reference_image_paths
                     ]
+                reference_image_sizes = img_md.get("reference_image_sizes", [])
+                if reference_image_sizes is None:
+                    reference_image_sizes = []
+                reference_image_sizes = [tuple(size) for size in reference_image_sizes]
 
                 negative_image_paths = img_md.get("negative_image_paths")
                 if negative_image_paths is None:
@@ -2556,6 +2698,7 @@ class FineTuningDataset(BaseDataset):
                     abs_path,
                     subset.caption_dropout_rate,
                     reference_image_paths=reference_image_paths,
+                    reference_image_sizes=reference_image_sizes,
                     negative_image_paths=negative_image_paths,
                 )
                 image_info.resize_interpolation = (
@@ -4934,6 +5077,20 @@ def add_dataset_arguments(
             "--in_json", type=str, default=None, help="json metadata for dataset / データセットのmetadataのjsonファイル"
         )
         parser.add_argument(
+            "--spawner_jsonl_pairs",
+            type=str,
+            default=None,
+            help=(
+                "spawner-style jsonl for paired edit training. Paths in local_input_image and output_image are resolved "
+                "relative to train_data_dir; summarized_text is used as caption."
+            ),
+        )
+        parser.add_argument(
+            "--spawner_jsonl_skip_missing",
+            action="store_true",
+            help="skip spawner jsonl entries whose local_input_image or output_image files do not exist",
+        )
+        parser.add_argument(
             "--dataset_repeats",
             type=int,
             default=1,
@@ -5690,7 +5847,15 @@ def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
         args.face_crop_aug_range = None
 
     if support_metadata:
-        if args.in_json is not None and (args.color_aug or args.random_crop):
+        if getattr(args, "spawner_jsonl_pairs", None) is not None:
+            if args.in_json is not None:
+                raise ValueError("--spawner_jsonl_pairs and --in_json are mutually exclusive")
+            if args.train_data_dir is None:
+                raise ValueError("--train_data_dir is required when --spawner_jsonl_pairs is specified")
+
+        if (args.in_json is not None or getattr(args, "spawner_jsonl_pairs", None) is not None) and (
+            args.color_aug or args.random_crop
+        ):
             logger.warning(
                 f"latents in npz is ignored when color_aug or random_crop is True / color_augまたはrandom_cropを有効にした場合、npzファイルのlatentsは無視されます"
             )
