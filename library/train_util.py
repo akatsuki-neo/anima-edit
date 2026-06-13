@@ -2362,6 +2362,17 @@ def _resolve_spawner_jsonl_path(root_dir: str, path: str) -> str:
     return os.path.normpath(os.path.join(root_dir, path))
 
 
+def _get_spawner_image_file_error(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except Exception as e:
+        return f"unreadable image ({type(e).__name__}: {e})"
+    return None
+
+
 def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: bool = False) -> Dict[str, Dict[str, Any]]:
     if image_dir is None:
         raise ValueError("--train_data_dir/image_dir is required for spawner jsonl pairs")
@@ -2397,10 +2408,12 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: 
             output_path = _resolve_spawner_jsonl_path(root_dir, output_image)
             input_path = _resolve_spawner_jsonl_path(root_dir, input_image)
             row_missing_paths = []
-            if not os.path.exists(output_path):
-                row_missing_paths.append(f"line {line_no} output_image: {output_image} -> {output_path}")
-            if not os.path.exists(input_path):
-                row_missing_paths.append(f"line {line_no} local_input_image: {input_image} -> {input_path}")
+            output_error = _get_spawner_image_file_error(output_path)
+            if output_error is not None:
+                row_missing_paths.append(f"line {line_no} output_image: {output_image} -> {output_path} ({output_error})")
+            input_error = _get_spawner_image_file_error(input_path)
+            if input_error is not None:
+                row_missing_paths.append(f"line {line_no} local_input_image: {input_image} -> {input_path} ({input_error})")
 
             if row_missing_paths:
                 missing_path_count += len(row_missing_paths)
@@ -2442,17 +2455,18 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: 
     if missing_path_count > 0 and not skip_missing:
         preview = "\n".join(missing_paths)
         remaining = missing_path_count - len(missing_paths)
-        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        suffix = f"\n... and {remaining} more missing/unreadable paths" if remaining > 0 else ""
         raise FileNotFoundError(
-            "spawner jsonl references missing image files after resolving paths relative to "
+            "spawner jsonl references missing or unreadable image files after resolving paths relative to "
             f"train_data_dir/image_dir={root_dir}:\n{preview}{suffix}"
         )
     if skipped_missing_entries > 0:
         preview = "\n".join(missing_paths)
         remaining = missing_path_count - len(missing_paths)
-        suffix = f"\n... and {remaining} more missing paths" if remaining > 0 else ""
+        suffix = f"\n... and {remaining} more missing/unreadable paths" if remaining > 0 else ""
         logger.warning(
-            f"skipped {skipped_missing_entries} spawner jsonl entries with missing image files. examples:\n{preview}{suffix}"
+            f"skipped {skipped_missing_entries} spawner jsonl entries with missing or unreadable image files. "
+            f"examples:\n{preview}{suffix}"
         )
     if duplicate_output_count > 0:
         examples = "; ".join(duplicate_output_examples)
