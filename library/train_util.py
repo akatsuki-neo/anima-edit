@@ -1013,9 +1013,40 @@ class BaseDataset(torch.utils.data.Dataset):
         min_size and max_size are ignored when enable_bucket is False
         """
         logger.info("loading image sizes.")
-        for info in tqdm(self.image_data.values()):
+        skipped_image_keys = []
+        for info in tqdm(list(self.image_data.values())):
             if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
+                try:
+                    info.image_size = self.get_image_size(info.absolute_path)
+                except (FileNotFoundError, IOError, OSError) as e:
+                    subset = self.image_to_subset.get(info.image_key)
+                    if subset is not None and getattr(subset, "spawner_jsonl_skip_missing", False):
+                        logger.warning(
+                            f"skipping spawner sample during bucket setup because target image size could not be read: "
+                            f"{info.absolute_path} ({e})"
+                        )
+                        skipped_image_keys.append(info.image_key)
+                        continue
+                    raise
+            if info.image_size is not None and (info.image_size[0] <= 0 or info.image_size[1] <= 0):
+                subset = self.image_to_subset.get(info.image_key)
+                if subset is not None and getattr(subset, "spawner_jsonl_skip_missing", False):
+                    logger.warning(
+                        f"skipping spawner sample during bucket setup because target image size is invalid: "
+                        f"{info.absolute_path} size={info.image_size}"
+                    )
+                    skipped_image_keys.append(info.image_key)
+                    continue
+                raise ValueError(f"image size is invalid: {info.absolute_path} size={info.image_size}")
+        for image_key in skipped_image_keys:
+            info = self.image_data.pop(image_key, None)
+            self.image_to_subset.pop(image_key, None)
+            if info is not None:
+                self.num_train_images = max(0, self.num_train_images - info.num_repeats)
+        if skipped_image_keys:
+            logger.warning(f"skipped {len(skipped_image_keys)} spawner samples before bucketing because image size was unavailable")
+        if len(self.image_data) == 0:
+            raise RuntimeError("no trainable images remain after filtering missing/unreadable spawner samples")
 
         # # run in parallel
         # max_workers = min(os.cpu_count(), len(self.image_data))  # TODO consider multi-gpu (processes)
