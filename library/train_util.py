@@ -1579,7 +1579,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self._length
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, _retry_count: int = 0):
         bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index = self.buckets_indices[index].batch_index * bucket_batch_size
@@ -1605,11 +1605,6 @@ class BaseDataset(torch.utils.data.Dataset):
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
             subset = self.image_to_subset[image_key]
-
-            custom_attributes.append(subset.custom_attributes)
-
-            # in case of fine tuning, is_reg is always False
-            loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
@@ -1640,9 +1635,15 @@ class BaseDataset(torch.utils.data.Dataset):
                 image = None
             else:
                 # 画像を読み込み、必要ならcropする
-                img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
-                    subset, image_info.absolute_path, subset.alpha_mask
-                )
+                try:
+                    img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
+                        subset, image_info.absolute_path, subset.alpha_mask
+                    )
+                except (FileNotFoundError, IOError, OSError) as e:
+                    if getattr(subset, "spawner_jsonl_skip_missing", False):
+                        logger.warning(f"skipping spawner sample with unreadable target image: {image_info.absolute_path} ({e})")
+                        continue
+                    raise
                 im_h, im_w = img.shape[0:2]
 
                 if self.enable_bucket:
@@ -1710,6 +1711,24 @@ class BaseDataset(torch.utils.data.Dataset):
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
                 del img
 
+            if getattr(subset, "spawner_jsonl_skip_missing", False):
+                try:
+                    for ref_path in image_info.reference_image_paths:
+                        if ref_path:
+                            _verify_spawner_image_file_readable(ref_path)
+                except (FileNotFoundError, IOError, OSError) as e:
+                    logger.warning(
+                        f"skipping spawner sample with unreadable reference image for target "
+                        f"{image_info.absolute_path}: {e}"
+                    )
+                    if len(masks) > len(captions):
+                        masks.pop()
+                    if len(masked_images) > len(captions):
+                        masked_images.pop()
+                    continue
+
+            custom_attributes.append(subset.custom_attributes)
+            loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
             images.append(image)
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
@@ -1779,6 +1798,15 @@ class BaseDataset(torch.utils.data.Dataset):
 
             input_ids_list.append(input_ids)
             captions.append(caption)
+
+        if len(captions) == 0:
+            if _retry_count >= len(self.buckets_indices):
+                raise RuntimeError(
+                    "all samples in the dataset were skipped because images were missing or unreadable; "
+                    "please check the spawner jsonl image paths"
+                )
+            next_index = (index + 1) % len(self.buckets_indices)
+            return self.__getitem__(next_index, _retry_count + 1)
 
         def none_or_stack_elements(tensors_list, converter):
             # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
@@ -2362,15 +2390,14 @@ def _resolve_spawner_jsonl_path(root_dir: str, path: str) -> str:
     return os.path.normpath(os.path.join(root_dir, path))
 
 
-def _get_spawner_image_file_error(path: str) -> Optional[str]:
+def _verify_spawner_image_file_readable(path: str) -> None:
     if not os.path.exists(path):
-        return "missing"
+        raise FileNotFoundError(path)
     try:
         with Image.open(path) as image:
             image.verify()
     except Exception as e:
-        return f"unreadable image ({type(e).__name__}: {e})"
-    return None
+        raise OSError(f"unreadable image: {path} ({type(e).__name__}: {e})") from e
 
 
 def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -2380,9 +2407,6 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: 
     root_dir = os.path.abspath(image_dir)
     metadata: Dict[str, Dict[str, Any]] = {}
     missing_size = 0
-    missing_paths: List[str] = []
-    missing_path_count = 0
-    skipped_missing_entries = 0
     duplicate_output_count = 0
     duplicate_output_examples: List[str] = []
     seen_output_paths: Dict[str, int] = {}
@@ -2407,21 +2431,6 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: 
 
             output_path = _resolve_spawner_jsonl_path(root_dir, output_image)
             input_path = _resolve_spawner_jsonl_path(root_dir, input_image)
-            row_missing_paths = []
-            output_error = _get_spawner_image_file_error(output_path)
-            if output_error is not None:
-                row_missing_paths.append(f"line {line_no} output_image: {output_image} -> {output_path} ({output_error})")
-            input_error = _get_spawner_image_file_error(input_path)
-            if input_error is not None:
-                row_missing_paths.append(f"line {line_no} local_input_image: {input_image} -> {input_path} ({input_error})")
-
-            if row_missing_paths:
-                missing_path_count += len(row_missing_paths)
-                if len(missing_paths) < 20:
-                    missing_paths.extend(row_missing_paths[: 20 - len(missing_paths)])
-                if skip_missing:
-                    skipped_missing_entries += 1
-                    continue
 
             image_md: Dict[str, Any] = {
                 "abs_path": output_path,
@@ -2452,22 +2461,8 @@ def _load_spawner_jsonl_pairs(metadata_file: str, image_dir: str, skip_missing: 
                 image_key = f"{output_path}#spawner_line_{line_no}"
             metadata[image_key] = image_md
 
-    if missing_path_count > 0 and not skip_missing:
-        preview = "\n".join(missing_paths)
-        remaining = missing_path_count - len(missing_paths)
-        suffix = f"\n... and {remaining} more missing/unreadable paths" if remaining > 0 else ""
-        raise FileNotFoundError(
-            "spawner jsonl references missing or unreadable image files after resolving paths relative to "
-            f"train_data_dir/image_dir={root_dir}:\n{preview}{suffix}"
-        )
-    if skipped_missing_entries > 0:
-        preview = "\n".join(missing_paths)
-        remaining = missing_path_count - len(missing_paths)
-        suffix = f"\n... and {remaining} more missing/unreadable paths" if remaining > 0 else ""
-        logger.warning(
-            f"skipped {skipped_missing_entries} spawner jsonl entries with missing or unreadable image files. "
-            f"examples:\n{preview}{suffix}"
-        )
+    if skip_missing:
+        logger.info("spawner_jsonl_skip_missing is enabled; missing or unreadable images will be skipped lazily when loaded")
     if duplicate_output_count > 0:
         examples = "; ".join(duplicate_output_examples)
         logger.warning(
@@ -5102,7 +5097,7 @@ def add_dataset_arguments(
         parser.add_argument(
             "--spawner_jsonl_skip_missing",
             action="store_true",
-            help="skip spawner jsonl entries whose local_input_image or output_image files do not exist",
+            help="skip spawner jsonl samples lazily when local_input_image or output_image is missing or unreadable",
         )
         parser.add_argument(
             "--dataset_repeats",
