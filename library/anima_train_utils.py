@@ -407,6 +407,11 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Use each target training image as its own reference image when metadata does not provide references.",
     )
     parser.add_argument(
+        "--anima_class_reference_test",
+        action="store_true",
+        help="Use a random different image from the same DreamBooth subfolder/class as reference when metadata does not provide references.",
+    )
+    parser.add_argument(
         "--anima_sample_reference_dir",
         type=str,
         default=None,

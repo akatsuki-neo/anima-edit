@@ -190,6 +190,7 @@ class ImageInfo:
         reference_image_paths: Optional[List[str]] = None,
         reference_image_sizes: Optional[List[Tuple[int, int]]] = None,
         negative_image_paths: Optional[List[str]] = None,
+        class_reference_image_paths: Optional[List[str]] = None,
     ) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
@@ -200,6 +201,7 @@ class ImageInfo:
         self.reference_image_paths: List[str] = reference_image_paths or []
         self.reference_image_sizes: List[Tuple[int, int]] = reference_image_sizes or []
         self.negative_image_paths: List[str] = negative_image_paths or []
+        self.class_reference_image_paths: List[str] = class_reference_image_paths or []
         self.image_size: Tuple[int, int] = None
         self.resized_size: Tuple[int, int] = None
         self.bucket_reso: Tuple[int, int] = None
@@ -752,6 +754,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
+        self.enable_class_reference_test = False
 
         self.replacements = {}
 
@@ -1002,6 +1005,31 @@ class BaseDataset(torch.utils.data.Dataset):
 
             input_ids = torch.stack(iids_list)  # 3,77
         return input_ids
+
+    def select_reference_image_paths(self, image_info: ImageInfo) -> List[str]:
+        if image_info.reference_image_paths:
+            return list(image_info.reference_image_paths)
+        if not self.enable_class_reference_test:
+            return []
+
+        class_reference_paths = getattr(image_info, "class_reference_image_paths", None)
+        if not class_reference_paths or len(class_reference_paths) < 2:
+            return []
+
+        current_path = os.path.normcase(os.path.abspath(image_info.absolute_path))
+        for _ in range(10):
+            candidate = random.choice(class_reference_paths)
+            if os.path.normcase(os.path.abspath(candidate)) != current_path:
+                return [candidate]
+
+        candidates = [
+            path
+            for path in class_reference_paths
+            if os.path.normcase(os.path.abspath(path)) != current_path
+        ]
+        if len(candidates) == 0:
+            return []
+        return [random.choice(candidates)]
 
     def register_image(self, info: ImageInfo, subset: BaseSubset):
         self.image_data[info.image_key] = info
@@ -1632,6 +1660,7 @@ class BaseDataset(torch.utils.data.Dataset):
         custom_attributes = []
         masks = []
         masked_images = []
+        included_image_keys = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1759,6 +1788,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     continue
 
             custom_attributes.append(subset.custom_attributes)
+            included_image_keys.append(image_key)
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
             images.append(image)
             latents_list.append(latents)
@@ -1876,17 +1906,15 @@ class BaseDataset(torch.utils.data.Dataset):
         # set example
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
-        example["image_paths"] = [
-            self.image_data[image_key].absolute_path for image_key in bucket[image_index : image_index + bucket_batch_size]
-        ]
+        example["image_paths"] = [self.image_data[image_key].absolute_path for image_key in included_image_keys]
         example["reference_image_paths"] = [
-            self.image_data[image_key].reference_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
+            self.select_reference_image_paths(self.image_data[image_key]) for image_key in included_image_keys
         ]
         example["reference_image_sizes"] = [
-            self.image_data[image_key].reference_image_sizes for image_key in bucket[image_index : image_index + bucket_batch_size]
+            self.image_data[image_key].reference_image_sizes for image_key in included_image_keys
         ]
         example["negative_image_paths"] = [
-            self.image_data[image_key].negative_image_paths for image_key in bucket[image_index : image_index + bucket_batch_size]
+            self.image_data[image_key].negative_image_paths for image_key in included_image_keys
         ]
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
@@ -2359,6 +2387,8 @@ class DreamBoothDataset(BaseDataset):
             else:
                 num_train_images += num_repeats * len(img_paths)
 
+            class_reference_image_paths = [] if subset.is_reg else list(img_paths)
+
             for img_path, caption, size in zip(img_paths, captions, sizes):
                 info = ImageInfo(
                     img_path,
@@ -2369,6 +2399,7 @@ class DreamBoothDataset(BaseDataset):
                     subset.caption_dropout_rate,
                     reference_image_paths=ref_paths_by_target.get(img_path, []),
                     negative_image_paths=neg_paths_by_target.get(img_path, []),
+                    class_reference_image_paths=class_reference_image_paths,
                 )
                 info.resize_interpolation = (
                     subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation

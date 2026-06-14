@@ -268,6 +268,37 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         if getattr(args, "anima_train_ip_adapter", False):
             args.anima_ip_adapter = True
 
+        if getattr(args, "anima_class_reference_test", False):
+            class_reference_dataset_count = 0
+            class_reference_sample_count = 0
+            for dataset_group in [train_dataset_group, val_dataset_group]:
+                if dataset_group is None:
+                    continue
+                for dataset in getattr(dataset_group, "datasets", [dataset_group]):
+                    if hasattr(dataset, "enable_class_reference_test"):
+                        dataset.enable_class_reference_test = True
+                        class_reference_dataset_count += 1
+                        class_reference_sample_count += sum(
+                            1
+                            for info in getattr(dataset, "image_data", {}).values()
+                            if len(getattr(info, "class_reference_image_paths", []) or []) > 1
+                        )
+            logger.info(
+                "--anima_class_reference_test enabled: "
+                f"{class_reference_sample_count} samples have same-class reference candidates "
+                f"across {class_reference_dataset_count} dataset(s)"
+            )
+            if class_reference_sample_count == 0:
+                logger.warning(
+                    "--anima_class_reference_test is enabled, but no sample has another target image in the same "
+                    "DreamBooth subfolder/class. Reference conditioning will fall back to existing metadata or none."
+                )
+            if not (getattr(args, "anima_multi_image_edit", False) or getattr(args, "anima_ip_adapter", False)):
+                logger.warning(
+                    "--anima_class_reference_test only supplies reference image paths. Enable --anima_multi_image_edit "
+                    "or --anima_ip_adapter to consume them during training."
+                )
+
         if getattr(args, "anima_multi_image_edit", False):
             assert not args.cache_latents and not args.cache_latents_to_disk, (
                 "--anima_multi_image_edit currently encodes reference images during training, so it cannot be used with "
