@@ -314,65 +314,43 @@ def sample_images(
     nextdit = accelerator.unwrap_model(nextdit)
     if gemma2_model is not None:
         gemma2_model = accelerator.unwrap_model(gemma2_model)
+    nextdit.switch_block_swap_for_inference()
 
-    if getattr(args, "sample_reference_dir", None) is not None:
-        prompts = _load_reference_sample_prompts(args.sample_reference_dir, getattr(args, "sample_max_references", 0))
-        if len(prompts) == 0:
-            logger.error(f"No image/txt sample pairs found in: {args.sample_reference_dir}")
-            return
-        for i, prompt_dict in enumerate(prompts):
-            prompt_dict["enum"] = i
-    else:
-        prompts = train_util.load_prompts(args.sample_prompts)
-    save_dir = args.output_dir + "/sample"
-    os.makedirs(save_dir, exist_ok=True)
-
-    # save random state to restore later
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
     try:
-        cuda_rng_state = (
-            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-        )
-    except Exception:
-        pass
+        if getattr(args, "sample_reference_dir", None) is not None:
+            prompts = _load_reference_sample_prompts(args.sample_reference_dir, getattr(args, "sample_max_references", 0))
+            if len(prompts) == 0:
+                logger.error(f"No image/txt sample pairs found in: {args.sample_reference_dir}")
+                return
+            for i, prompt_dict in enumerate(prompts):
+                prompt_dict["enum"] = i
+        else:
+            prompts = train_util.load_prompts(args.sample_prompts)
+        save_dir = args.output_dir + "/sample"
+        os.makedirs(save_dir, exist_ok=True)
 
-    if getattr(args, "multi_image_edit", False) and args.sample_batch_size is None:
-        batch_size = 1
-        logger.info("Using sample batch size 1 for --multi_image_edit. Set --sample_batch_size to override.")
-    else:
-        batch_size = args.sample_batch_size or args.train_batch_size or 1
-
-    if distributed_state.num_processes <= 1:
-        # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
-        # TODO: batch prompts together with buckets of image sizes
-        for prompt_dicts in batchify(prompts, batch_size):
-            sample_image_inference(
-                accelerator,
-                args,
-                nextdit,
-                gemma2_model,
-                vae,
-                save_dir,
-                prompt_dicts,
-                epoch,
-                global_step,
-                sample_prompts_gemma2_outputs,
-                prompt_replacement,
-                controlnet,
+        # save random state to restore later
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = None
+        try:
+            cuda_rng_state = (
+                torch.cuda.get_rng_state() if torch.cuda.is_available() else None
             )
-    else:
-        # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
-        # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
-        per_process_prompts = []  # list of lists
-        for i in range(distributed_state.num_processes):
-            per_process_prompts.append(prompts[i :: distributed_state.num_processes])
+        except Exception:
+            pass
 
-        with distributed_state.split_between_processes(
-            per_process_prompts
-        ) as prompt_dict_lists:
+        if getattr(args, "multi_image_edit", False) and args.sample_batch_size is None:
+            batch_size = 1
+            logger.info("Using sample batch size 1 for --multi_image_edit. Set --sample_batch_size to override.")
+        else:
+            batch_size = args.sample_batch_size or args.train_batch_size or 1
+
+        if distributed_state.num_processes <= 1:
+            # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
             # TODO: batch prompts together with buckets of image sizes
-            for prompt_dicts in batchify(prompt_dict_lists[0], batch_size):
+            sample_batches = list(batchify(prompts, batch_size))
+            for prompt_dicts in tqdm(sample_batches, desc="Lumina samples", disable=not accelerator.is_main_process):
+                nextdit.prepare_block_swap_before_forward()
                 sample_image_inference(
                     accelerator,
                     args,
@@ -387,12 +365,42 @@ def sample_images(
                     prompt_replacement,
                     controlnet,
                 )
+        else:
+            # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
+            # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
+            per_process_prompts = []  # list of lists
+            for i in range(distributed_state.num_processes):
+                per_process_prompts.append(prompts[i :: distributed_state.num_processes])
 
-    torch.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state)
+            with distributed_state.split_between_processes(
+                per_process_prompts
+            ) as prompt_dict_lists:
+                # TODO: batch prompts together with buckets of image sizes
+                sample_batches = list(batchify(prompt_dict_lists[0], batch_size))
+                for prompt_dicts in tqdm(sample_batches, desc="Lumina samples", disable=not accelerator.is_main_process):
+                    nextdit.prepare_block_swap_before_forward()
+                    sample_image_inference(
+                        accelerator,
+                        args,
+                        nextdit,
+                        gemma2_model,
+                        vae,
+                        save_dir,
+                        prompt_dicts,
+                        epoch,
+                        global_step,
+                        sample_prompts_gemma2_outputs,
+                        prompt_replacement,
+                        controlnet,
+                    )
 
-    clean_memory_on_device(accelerator.device)
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state)
+
+        clean_memory_on_device(accelerator.device)
+    finally:
+        nextdit.switch_block_swap_for_training()
 
 
 @torch.no_grad()
@@ -500,13 +508,13 @@ def sample_image_inference(
         if gemma2_conds is None and gemma2_model is not None:
             tokens_and_masks = tokenize_strategy.tokenize(prompt)
             gemma2_conds = encoding_strategy.encode_tokens(
-                tokenize_strategy, gemma2_model, tokens_and_masks
+                tokenize_strategy, [gemma2_model], tokens_and_masks
             )
 
         if neg_gemma2_conds is None and gemma2_model is not None:
             tokens_and_masks = tokenize_strategy.tokenize(negative_prompt, is_negative=True)
             neg_gemma2_conds = encoding_strategy.encode_tokens(
-                tokenize_strategy, gemma2_model, tokens_and_masks
+                tokenize_strategy, [gemma2_model], tokens_and_masks
             )
 
         if gemma2_conds is None or neg_gemma2_conds is None:
@@ -571,7 +579,8 @@ def sample_image_inference(
     reference_preview_images = []
     if getattr(args, "multi_image_edit", False):
         reference_latents = []
-        for prompt_dict in prompt_dicts:
+        logger.info(f"Encoding Lumina sample reference images for {len(prompt_dicts)} prompt(s)")
+        for prompt_dict in tqdm(prompt_dicts, desc="Lumina sample refs", disable=not accelerator.is_main_process):
             refs, previews = _encode_sample_reference_images(prompt_dict, args, nextdit, vae, accelerator.device, weight_dtype)
             reference_latents.append(refs)
             reference_preview_images.append(previews)
@@ -581,6 +590,7 @@ def sample_image_inference(
         for prompt_dict in prompt_dicts:
             reference_preview_images.append([Image.open(path).convert("RGB") for path in _get_sample_reference_paths(prompt_dict)])
 
+    logger.info(f"Starting Lumina denoise: batch={noise.shape[0]}, steps={sample_steps}, size={width}x{height}")
     with accelerator.autocast():
         x = denoise(
             scheduler,
@@ -814,7 +824,7 @@ def denoise(
         img (Tensor): Denoised latent tensor
     """
 
-    for i, t in enumerate(tqdm(timesteps)):
+    for i, t in enumerate(tqdm(timesteps, desc="Lumina denoise")):
         model.prepare_block_swap_before_forward()
 
         # reverse the timestep since Lumina uses t=0 as the noise and t=1 as the image

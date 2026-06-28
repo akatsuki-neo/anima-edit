@@ -1443,6 +1443,20 @@ class NextDiT(nn.Module):
         
         self.offloader_main.prepare_block_devices_before_forward(self.layers)
 
+    def switch_block_swap_for_inference(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_main.set_forward_only(True)
+        self.prepare_block_swap_before_forward()
+        logger.info("Lumina: Block swap set to forward only.")
+
+    def switch_block_swap_for_training(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader_main.set_forward_only(False)
+        self.prepare_block_swap_before_forward()
+        logger.info("Lumina: Block swap set to forward and backward.")
+
 
 #############################################################################
 #                                 NextDiT Configs                               #
