@@ -96,8 +96,8 @@ def batchify(
             while start < len(prompts):
                 end = start + batch_size
                 batch = prompts[start:end]
-            yield batch
-            start = end
+                yield batch
+                start = end
 
 
 def _load_reference_sample_prompts(sample_reference_dir: str, max_references: int = 0) -> list[dict]:
@@ -350,7 +350,7 @@ def sample_images(
             # TODO: batch prompts together with buckets of image sizes
             sample_batches = list(batchify(prompts, batch_size))
             for prompt_dicts in tqdm(sample_batches, desc="Lumina samples", disable=not accelerator.is_main_process):
-                nextdit.prepare_block_swap_before_forward()
+                logger.info(f"Running Lumina sample batch with {len(prompt_dicts)} prompt(s)")
                 sample_image_inference(
                     accelerator,
                     args,
@@ -378,7 +378,7 @@ def sample_images(
                 # TODO: batch prompts together with buckets of image sizes
                 sample_batches = list(batchify(prompt_dict_lists[0], batch_size))
                 for prompt_dicts in tqdm(sample_batches, desc="Lumina samples", disable=not accelerator.is_main_process):
-                    nextdit.prepare_block_swap_before_forward()
+                    logger.info(f"Running Lumina sample batch with {len(prompt_dicts)} prompt(s)")
                     sample_image_inference(
                         accelerator,
                         args,
@@ -446,6 +446,7 @@ def sample_image_inference(
     assert isinstance(encoding_strategy, strategy_lumina.LuminaTextEncodingStrategy)
 
     text_conds = []
+    logger.info("Preparing Lumina sample prompt conditioning")
 
     # assuming seed, width, height, sample steps, guidance are the same
     width = int(prompt_dicts[0].get("width", 1024))
