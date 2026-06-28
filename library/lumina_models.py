@@ -1261,7 +1261,7 @@ class NextDiT(nn.Module):
             x: (N, C, H, W) denoised latents
         """
         has_reference_latents = reference_latents is not None and any(len(refs or []) > 0 for refs in reference_latents)
-        if has_reference_latents and x.shape[0] > 1:
+        if has_reference_latents and x.shape[0] > 1 and not self.blocks_to_swap:
             outputs = []
             for sample_index in range(x.shape[0]):
                 sample_refs = [reference_latents[sample_index] or []]

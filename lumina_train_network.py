@@ -60,6 +60,13 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 "--multi_image_edit currently encodes reference images during training, so it cannot be used with "
                 "--cache_latents or --cache_latents_to_disk yet."
             )
+            if getattr(args, "blocks_to_swap", None) and args.blocks_to_swap > 0 and args.train_batch_size > 1:
+                raise AssertionError(
+                    "--multi_image_edit with --blocks_to_swap does not support train_batch_size > 1. "
+                    "Block swap uses a forward/backward offloader state machine that is not safe across multiple "
+                    "per-sample forwards before one backward pass. Use --train_batch_size 1 and increase "
+                    "--gradient_accumulation_steps instead."
+                )
             if args.train_batch_size and args.train_batch_size > 1:
                 logger.warning(
                     "--multi_image_edit appends reference image tokens to the main DiT sequence. "
