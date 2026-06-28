@@ -388,7 +388,7 @@ class JointAttention(nn.Module):
                     xq.permute(0, 2, 1, 3),
                     xk.permute(0, 2, 1, 3),
                     xv.permute(0, 2, 1, 3),
-                    attn_mask=x_mask.bool().view(bsz, 1, 1, seqlen).expand(-1, self.n_local_heads, seqlen, -1),
+                    attn_mask=x_mask.bool().view(bsz, 1, 1, seqlen),
                     scale=softmax_scale,
                 )
                 .permute(0, 2, 1, 3)
