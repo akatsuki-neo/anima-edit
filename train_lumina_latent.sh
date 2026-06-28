@@ -1,8 +1,8 @@
 accelerate launch lumina_train_network.py \
-  --pretrained_model_name_or_path /root/autodl-tmp/ComfyUI/models/diffusion_models/lumina-2.safetensors \
+  --pretrained_model_name_or_path /root/autodl-tmp/ComfyUI/models/diffusion_models/NetaYumev4_unet.safetensors \
   --ae /root/autodl-tmp/ComfyUI/models/vae/ae.safetensors \
-  --gemma2 /root/autodl-tmp/ckn/gemma2 \
-  --train_data_dir /root/autodl-tmp/ckn/anima-edit-action-transfer-12-akatsuki-vlm \
+  --gemma2 /root/autodl-tmp/ComfyUI/models/text_encoders/gemma_2_2b_fp16.safetensors \
+  --train_data_dir /root/autodl-tmp/edit \
   --output_dir out_edit \
   --output_name lumina_dora_no_refiner \
   --network_module networks.dora \
@@ -25,10 +25,11 @@ accelerate launch lumina_train_network.py \
   --caption_extension .txt \
   --multi_image_edit \
   --gradient_checkpointing \
+  --gradient_accumulation_steps 4 \
   --log_with wandb \
   --logging_dir logs \
   --log_tracker_name lumina-edit \
   --wandb_run_name lumina_dora_no_refiner \
   --sample_every_n_steps 50 \
-  --sample_reference_dir /root/autodl-tmp/ckn/etest \
-  --save_every_n_steps 200
+  --sample_reference_dir /root/autodl-tmp/etest \
+  --save_every_n_steps 200 \
