@@ -256,6 +256,10 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         text_encoder,
         lumina,
     ):
+        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+        te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
+        gemma2_model = te[0] if te is not None else None
+
         lumina_train_util.sample_images(
             accelerator,
             args,
@@ -263,7 +267,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             global_step,
             lumina,
             vae,
-            self.get_models_for_text_encoding(args, accelerator, text_encoder),
+            gemma2_model,
             self.sample_prompts_te_outputs,
         )
 
