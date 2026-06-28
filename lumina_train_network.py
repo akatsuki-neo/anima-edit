@@ -60,6 +60,18 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                 "--multi_image_edit currently encodes reference images during training, so it cannot be used with "
                 "--cache_latents or --cache_latents_to_disk yet."
             )
+            if args.train_batch_size and args.train_batch_size > 1:
+                logger.warning(
+                    "--multi_image_edit appends reference image tokens to the main DiT sequence. "
+                    "Attention memory grows quadratically with text + target + reference tokens, and each batch is "
+                    "padded to the largest reference token count in that batch. If VRAM spikes, use "
+                    "--train_batch_size 1 with --gradient_accumulation_steps, and lower --reference_max_area."
+                )
+            if getattr(args, "reference_max_area", 0) and args.reference_max_area > 1024 * 1024:
+                logger.warning(
+                    "--reference_max_area is larger than 1024*1024 in edit mode; large reference images can cause "
+                    "very high attention memory use."
+                )
 
         self.train_gemma2 = not args.network_train_unet_only
 

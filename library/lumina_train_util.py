@@ -337,7 +337,11 @@ def sample_images(
     except Exception:
         pass
 
-    batch_size = args.sample_batch_size or args.train_batch_size or 1
+    if getattr(args, "multi_image_edit", False) and args.sample_batch_size is None:
+        batch_size = 1
+        logger.info("Using sample batch size 1 for --multi_image_edit. Set --sample_batch_size to override.")
+    else:
+        batch_size = args.sample_batch_size or args.train_batch_size or 1
 
     if distributed_state.num_processes <= 1:
         # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.

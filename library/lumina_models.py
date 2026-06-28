@@ -1221,6 +1221,23 @@ class NextDiT(nn.Module):
         Returns:
             x: (N, C, H, W) denoised latents
         """
+        has_reference_latents = reference_latents is not None and any(len(refs or []) > 0 for refs in reference_latents)
+        if has_reference_latents and x.shape[0] > 1:
+            outputs = []
+            for sample_index in range(x.shape[0]):
+                sample_refs = [reference_latents[sample_index] or []]
+                outputs.append(
+                    self.forward(
+                        x=x[sample_index : sample_index + 1],
+                        t=t[sample_index : sample_index + 1],
+                        cap_feats=cap_feats[sample_index : sample_index + 1],
+                        cap_mask=cap_mask[sample_index : sample_index + 1],
+                        reference_latents=sample_refs,
+                        reference_t_offset_scale=reference_t_offset_scale,
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
         _, _, height, width = x.shape  # B, C, H, W
         t = self.t_embedder(t)  # (N, D)
         cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
