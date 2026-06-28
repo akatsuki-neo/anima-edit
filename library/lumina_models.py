@@ -99,7 +99,8 @@ except ImportError:
             # To handle float8 we need to convert the tensor to float
             x = x.float()
             rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
-            return ((x * rrms) * self.weight.float()).to(dtype=x_dtype)
+            weight = self.weight.to(device=x.device, dtype=torch.float32)
+            return ((x * rrms) * weight).to(dtype=x_dtype)
 
 
 
