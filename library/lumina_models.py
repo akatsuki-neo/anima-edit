@@ -1020,11 +1020,12 @@ class NextDiT(nn.Module):
             output: (N, C, H, W)
         """
         pH = pW = self.patch_size
+        image_seq_len = (height // pH) * (width // pW)
 
         output = []
-        for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        for i, encoder_seq_len in enumerate(encoder_seq_lengths):
             output.append(
-                x[i][encoder_seq_len:seq_len]
+                x[i][encoder_seq_len : encoder_seq_len + image_seq_len]
                 .view(height // pH, width // pW, pH, pW, self.out_channels)
                 .permute(4, 0, 2, 1, 3)
                 .flatten(3, 4)
@@ -1040,6 +1041,8 @@ class NextDiT(nn.Module):
         cap_feats: Tensor,
         cap_mask: Tensor,
         t: Tensor,
+        reference_latents: Optional[List[List[Tensor]]] = None,
+        reference_t_offset_scale: int = 10,
     ) -> Tuple[Tensor, Tensor, Tensor, List[int], List[int]]:
         """
         Patchify and embed the input image and caption features.
@@ -1062,8 +1065,19 @@ class NextDiT(nn.Module):
         l_effective_cap_len = cap_mask.sum(dim=1).tolist()
         encoder_seq_len = cap_mask.shape[1]
         image_seq_len = (height // self.patch_size) * (width // self.patch_size)
+        has_reference_latents = reference_latents is not None and any(len(refs or []) > 0 for refs in reference_latents)
 
-        seq_lengths = [cap_seq_len + image_seq_len for cap_seq_len in l_effective_cap_len]
+        reference_seq_lens = [0] * bsz
+        if has_reference_latents:
+            for i, refs in enumerate(reference_latents):
+                for ref_latent in refs or []:
+                    ref_h, ref_w = ref_latent.shape[-2:]
+                    reference_seq_lens[i] += (ref_h // self.patch_size) * (ref_w // self.patch_size)
+
+        seq_lengths = [
+            cap_seq_len + image_seq_len + reference_seq_len
+            for cap_seq_len, reference_seq_len in zip(l_effective_cap_len, reference_seq_lens)
+        ]
         max_seq_len = max(seq_lengths)
 
         position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
@@ -1077,8 +1091,23 @@ class NextDiT(nn.Module):
             row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
             col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 
-            position_ids[i, cap_len:seq_len, 1] = row_ids
-            position_ids[i, cap_len:seq_len, 2] = col_ids
+            image_end = cap_len + image_seq_len
+            position_ids[i, cap_len:image_end, 1] = row_ids
+            position_ids[i, cap_len:image_end, 2] = col_ids
+
+            ref_offset = image_end
+            if has_reference_latents:
+                for ref_index, ref_latent in enumerate(reference_latents[i] or []):
+                    ref_h, ref_w = ref_latent.shape[-2:]
+                    ref_h_tokens, ref_w_tokens = ref_h // pH, ref_w // pW
+                    ref_len = ref_h_tokens * ref_w_tokens
+                    ref_row_ids = torch.arange(ref_h_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, ref_w_tokens).flatten()
+                    ref_col_ids = torch.arange(ref_w_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(ref_h_tokens, 1).flatten()
+                    ref_end = ref_offset + ref_len
+                    position_ids[i, ref_offset:ref_end, 0] = cap_len + reference_t_offset_scale * (ref_index + 1)
+                    position_ids[i, ref_offset:ref_end, 1] = ref_row_ids
+                    position_ids[i, ref_offset:ref_end, 2] = ref_col_ids
+                    ref_offset = ref_end
 
         # Get combined rotary embeddings
         freqs_cis = self.rope_embedder(position_ids)
@@ -1101,7 +1130,7 @@ class NextDiT(nn.Module):
 
         for i, (cap_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
             cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
-            img_freqs_cis[i, :image_seq_len] = freqs_cis[i, cap_len:seq_len]
+            img_freqs_cis[i, :image_seq_len] = freqs_cis[i, cap_len : cap_len + image_seq_len]
 
         # Refine caption context
         for layer in self.context_refiner:
@@ -1119,18 +1148,68 @@ class NextDiT(nn.Module):
         for layer in self.noise_refiner:
             x = layer(x, x_mask, img_freqs_cis, t)
 
+        reference_tokens = [[] for _ in range(bsz)]
+        if has_reference_latents:
+            for sample_index, refs in enumerate(reference_latents):
+                for ref_index, ref_latent in enumerate(refs or []):
+                    ref_latent = ref_latent.to(device=device, dtype=x.dtype)
+                    ref_bsz, ref_channels, ref_height, ref_width = ref_latent.shape
+                    if ref_bsz != 1:
+                        raise ValueError("Each Lumina reference latent must have batch size 1.")
+                    ref_tokens = (
+                        ref_latent.view(ref_bsz, ref_channels, ref_height // pH, pH, ref_width // pW, pW)
+                        .permute(0, 2, 4, 3, 5, 1)
+                        .flatten(3)
+                        .flatten(1, 2)
+                    )
+                    ref_tokens = self.x_embedder(ref_tokens)
+
+                    ref_h_tokens, ref_w_tokens = ref_height // pH, ref_width // pW
+                    ref_len = ref_h_tokens * ref_w_tokens
+                    ref_position_ids = torch.zeros(1, ref_len, 3, dtype=torch.int32, device=device)
+                    ref_position_ids[..., 0] = l_effective_cap_len[sample_index] + reference_t_offset_scale * (ref_index + 1)
+                    ref_position_ids[..., 1] = (
+                        torch.arange(ref_h_tokens, dtype=torch.int32, device=device)
+                        .view(-1, 1)
+                        .repeat(1, ref_w_tokens)
+                        .flatten()
+                    )
+                    ref_position_ids[..., 2] = (
+                        torch.arange(ref_w_tokens, dtype=torch.int32, device=device)
+                        .view(1, -1)
+                        .repeat(ref_h_tokens, 1)
+                        .flatten()
+                    )
+                    ref_freqs_cis = self.rope_embedder(ref_position_ids)
+                    ref_mask = torch.ones(1, ref_len, dtype=torch.bool, device=device)
+                    ref_t = t[sample_index : sample_index + 1]
+                    for layer in self.noise_refiner:
+                        ref_tokens = layer(ref_tokens, ref_mask, ref_freqs_cis, ref_t)
+                    reference_tokens[sample_index].append(ref_tokens.squeeze(0))
+
         joint_hidden_states = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x.dtype)
         attention_mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
         for i, (cap_len, seq_len) in enumerate(zip(l_effective_cap_len, seq_lengths)):
             attention_mask[i, :seq_len] = True
             joint_hidden_states[i, :cap_len] = cap_feats[i, :cap_len]
-            joint_hidden_states[i, cap_len:seq_len] = x[i]
+            image_end = cap_len + image_seq_len
+            joint_hidden_states[i, cap_len:image_end] = x[i]
+            if reference_tokens[i]:
+                joint_hidden_states[i, image_end:seq_len] = torch.cat(reference_tokens[i], dim=0)
 
         x = joint_hidden_states
 
         return x, attention_mask, freqs_cis, l_effective_cap_len, seq_lengths
 
-    def forward(self, x: Tensor, t: Tensor, cap_feats: Tensor, cap_mask: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        cap_feats: Tensor,
+        cap_mask: Tensor,
+        reference_latents: Optional[List[List[Tensor]]] = None,
+        reference_t_offset_scale: int = 10,
+    ) -> Tensor:
         """
         Forward pass of NextDiT.
         Args:
@@ -1146,7 +1225,14 @@ class NextDiT(nn.Module):
         t = self.t_embedder(t)  # (N, D)
         cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
 
-        x, mask, freqs_cis, l_effective_cap_len, seq_lengths = self.patchify_and_embed(x, cap_feats, cap_mask, t)
+        x, mask, freqs_cis, l_effective_cap_len, seq_lengths = self.patchify_and_embed(
+            x,
+            cap_feats,
+            cap_mask,
+            t,
+            reference_latents=reference_latents,
+            reference_t_offset_scale=reference_t_offset_scale,
+        )
 
         if not self.blocks_to_swap:
             for layer in self.layers:

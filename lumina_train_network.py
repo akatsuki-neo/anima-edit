@@ -1,8 +1,12 @@
 import argparse
 import copy
+import math
+import os
 from typing import Any, Tuple
 
 import torch
+from PIL import Image
+from torchvision import transforms
 
 from library.device_utils import clean_memory_on_device, init_ipex
 
@@ -30,6 +34,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() == "true"
+
+
 class LuminaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -47,7 +57,27 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
 
+        if getattr(args, "multi_image_edit", False):
+            assert not args.cache_latents and not args.cache_latents_to_disk, (
+                "--multi_image_edit currently encodes reference images during training, so it cannot be used with "
+                "--cache_latents or --cache_latents_to_disk yet."
+            )
+
         self.train_gemma2 = not args.network_train_unet_only
+
+        if args.network_args is None:
+            args.network_args = []
+
+        net_kwargs = {}
+        for net_arg in args.network_args:
+            if "=" in net_arg:
+                key, value = net_arg.split("=", 1)
+                net_kwargs[key] = value
+
+        if "train_text_refiner" not in net_kwargs:
+            args.network_args.append(f"train_text_refiner={args.train_text_refiner_network}")
+        if "train_noise_refiner" not in net_kwargs:
+            args.network_args.append(f"train_noise_refiner={args.train_noise_refiner_network}")
 
     def load_target_model(self, args, weight_dtype, accelerator):
         loading_dtype = None if args.fp8_base else weight_dtype
@@ -235,6 +265,105 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
     def shift_scale_latents(self, args, latents):
         return latents
 
+    def preprocess_reference_image(self, image, args, lumina: lumina_models.NextDiT):
+        image = Image.fromarray(image[:, :, :3]).convert("RGB")
+        max_area = getattr(args, "reference_max_area", 1024 * 1024)
+        if max_area is not None and max_area > 0 and image.width * image.height > max_area:
+            scale = math.sqrt(max_area / (image.width * image.height))
+            image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+
+        multiple_of = 8 * lumina.patch_size
+        width = (image.width // multiple_of) * multiple_of
+        height = (image.height // multiple_of) * multiple_of
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f"Reference image is too small after alignment: {image.width}x{image.height}. "
+                f"Both dimensions must be at least {multiple_of}px."
+            )
+
+        left = (image.width - width) // 2
+        top = (image.height - height) // 2
+        return image.crop((left, top, left + width, top + height))
+
+    def load_reference_latents_from_batch(self, args, vae, batch, accelerator, vae_dtype, weight_dtype, lumina: lumina_models.NextDiT):
+        if not getattr(args, "multi_image_edit", False):
+            return None
+
+        reference_latents = batch.get("reference_latents", None)
+        if reference_latents is not None:
+            return reference_latents
+
+        reference_image_paths = batch.get("reference_image_paths", None)
+        if reference_image_paths is None:
+            return None
+
+        image_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]
+        )
+
+        encoded_batch = []
+        for sample_paths in reference_image_paths:
+            sample_latents = []
+            for path in sample_paths or []:
+                if not path:
+                    continue
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"Reference image not found: {path}")
+                image = self.preprocess_reference_image(train_util.load_image(path), args, lumina)
+                image_tensor = image_transform(image).unsqueeze(0).to(accelerator.device, dtype=vae_dtype)
+                with torch.no_grad():
+                    latent = self.encode_images_to_latents(args, vae, image_tensor)
+                    if torch.any(torch.isnan(latent)):
+                        accelerator.print("NaN found in reference latents, replacing with zeros")
+                        latent = torch.nan_to_num(latent, 0, out=latent)
+                sample_latents.append(self.shift_scale_latents(args, latent).to(accelerator.device, dtype=weight_dtype))
+            encoded_batch.append(sample_latents)
+
+        if not any(len(refs) > 0 for refs in encoded_batch):
+            return None
+        return encoded_batch
+
+    def process_batch(
+        self,
+        batch,
+        text_encoders,
+        unet,
+        network,
+        vae,
+        noise_scheduler,
+        vae_dtype,
+        weight_dtype,
+        accelerator,
+        args,
+        text_encoding_strategy,
+        tokenize_strategy,
+        is_train=True,
+        train_text_encoder=True,
+        train_unet=True,
+    ):
+        self._current_vae = vae
+        self._current_vae_dtype = vae_dtype
+        return super().process_batch(
+            batch,
+            text_encoders,
+            unet,
+            network,
+            vae,
+            noise_scheduler,
+            vae_dtype,
+            weight_dtype,
+            accelerator,
+            args,
+            text_encoding_strategy,
+            tokenize_strategy,
+            is_train=is_train,
+            train_text_encoder=train_text_encoder,
+            train_unet=train_unet,
+        )
+
     def get_noise_pred_and_target(
         self,
         args,
@@ -266,14 +395,26 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         # Unpack Gemma2 outputs
         gemma2_hidden_states, input_ids, gemma2_attn_mask = text_encoder_conds
 
-        def call_dit(img, gemma2_hidden_states, gemma2_attn_mask, timesteps):
+        reference_latents = self.load_reference_latents_from_batch(
+            args,
+            self._current_vae,
+            batch,
+            accelerator,
+            self._current_vae_dtype,
+            weight_dtype,
+            accelerator.unwrap_model(dit),
+        )
+
+        def call_dit(img, gemma2_hidden_states, gemma2_attn_mask, timesteps, reference_latents=None):
             with torch.set_grad_enabled(is_train), accelerator.autocast():
                 # NextDiT forward expects (x, t, cap_feats, cap_mask)
                 model_pred = dit(
                     x=img,  # image latents (B, C, H, W)
-                    t=1 - timesteps / 1000,  # timesteps需要除以1000来匹配模型预期
-                    cap_feats=gemma2_hidden_states,  # Gemma2的hidden states作为caption features
-                    cap_mask=gemma2_attn_mask.to(dtype=torch.int32),  # Gemma2的attention mask
+                    t=1 - timesteps / 1000,
+                    cap_feats=gemma2_hidden_states,
+                    cap_mask=gemma2_attn_mask.to(dtype=torch.int32),
+                    reference_latents=reference_latents,
+                    reference_t_offset_scale=args.reference_t_offset_scale,
                 )
             return model_pred
 
@@ -282,6 +423,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
             gemma2_hidden_states=gemma2_hidden_states,
             gemma2_attn_mask=gemma2_attn_mask,
             timesteps=timesteps,
+            reference_latents=reference_latents,
         )
 
         # apply model prediction type
@@ -305,6 +447,11 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
                         gemma2_hidden_states=gemma2_hidden_states[diff_output_pr_indices],
                         timesteps=timesteps[diff_output_pr_indices],
                         gemma2_attn_mask=(gemma2_attn_mask[diff_output_pr_indices]),
+                        reference_latents=(
+                            [reference_latents[i] for i in diff_output_pr_indices]
+                            if reference_latents is not None
+                            else None
+                        ),
                     )
                 network.set_multiplier(1.0)
 
@@ -373,8 +520,36 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     train_util.add_dit_training_arguments(parser)
     lumina_train_util.add_lumina_train_arguments(parser)
+    parser.add_argument(
+        "--train_text_refiner_network",
+        type=str_to_bool,
+        default=True,
+        help="train network modules for Lumina text/context refiner; set false to skip",
+    )
+    parser.add_argument(
+        "--train_noise_refiner_network",
+        type=str_to_bool,
+        default=True,
+        help="train network modules for Lumina noise refiner; set false to skip",
+    )
+    parser.add_argument(
+        "--multi_image_edit",
+        action="store_true",
+        help="Enable multi-image reference latent conditioning for Lumina training.",
+    )
+    parser.add_argument(
+        "--reference_t_offset_scale",
+        type=int,
+        default=10,
+        help="T-coordinate spacing between reference images for Lumina multi-image reference conditioning.",
+    )
+    parser.add_argument(
+        "--reference_max_area",
+        type=int,
+        default=1024 * 1024,
+        help="Maximum reference image area before aspect-preserving downscale. Set 0 to disable.",
+    )
     return parser
-
 
 if __name__ == "__main__":
     parser = setup_parser()

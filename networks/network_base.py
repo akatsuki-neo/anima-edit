@@ -60,6 +60,16 @@ def detect_arch_config(unet, text_encoders) -> ArchConfig:
             adapter_target_modules=["LLMAdapterTransformerBlock"],
         )
 
+    # Lumina 2: JointTransformerBlock
+    if "JointTransformerBlock" in module_class_names:
+        return ArchConfig(
+            unet_target_modules=["JointTransformerBlock", "FinalLayer"],
+            te_target_modules=["Gemma2Attention", "Gemma2FlashAttention2", "Gemma2SdpaAttention", "Gemma2MLP"],
+            unet_prefix="lora_unet",
+            te_prefixes=["lora_te"],
+            default_excludes=[],
+        )
+
     raise ValueError(f"Cannot auto-detect architecture for LyCORIS. Module classes found: {sorted(module_class_names)}")
 
 

@@ -515,6 +515,13 @@ def create_network(
         if not isinstance(exclude_patterns, list):
             exclude_patterns = [exclude_patterns]
     exclude_patterns.extend(arch_config.default_excludes)
+    if "JointTransformerBlock" in arch_config.unet_target_modules:
+        train_text_refiner = _as_bool(kwargs.get("train_text_refiner", "true"), default=True)
+        train_noise_refiner = _as_bool(kwargs.get("train_noise_refiner", "true"), default=True)
+        if not train_text_refiner:
+            exclude_patterns.append(r".*context_refiner.*")
+        if not train_noise_refiner:
+            exclude_patterns.append(r".*noise_refiner.*")
 
     include_patterns = kwargs.get("include_patterns", None)
     if include_patterns is not None:

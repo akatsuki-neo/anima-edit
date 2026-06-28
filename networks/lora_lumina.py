@@ -22,6 +22,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _as_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() == "true"
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -378,6 +386,9 @@ def create_network(
     if verbose is not None:
         verbose = True if verbose == "True" else False
 
+    train_text_refiner = _as_bool(kwargs.get("train_text_refiner", None), default=True)
+    train_noise_refiner = _as_bool(kwargs.get("train_noise_refiner", None), default=True)
+
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
         text_encoders,
@@ -394,6 +405,8 @@ def create_network(
         split_qkv=split_qkv,
         type_dims=type_dims,
         embedder_dims=embedder_dims,
+        train_text_refiner=train_text_refiner,
+        train_noise_refiner=train_noise_refiner,
         verbose=verbose,
     )
 
@@ -493,6 +506,8 @@ class LoRANetwork(torch.nn.Module):
         type_dims: Optional[List[int]] = None,
         embedder_dims: Optional[List[int]] = None,
         train_block_indices: Optional[List[bool]] = None,
+        train_text_refiner: bool = True,
+        train_noise_refiner: bool = True,
         verbose: Optional[bool] = False,
     ) -> None:
         super().__init__()
@@ -506,6 +521,8 @@ class LoRANetwork(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
         self.train_blocks = train_blocks if train_blocks is not None else "all"
+        self.train_text_refiner = train_text_refiner
+        self.train_noise_refiner = train_noise_refiner
         self.split_qkv = split_qkv
 
         self.type_dims = type_dims
@@ -534,6 +551,10 @@ class LoRANetwork(torch.nn.Module):
             logger.info(f"split qkv for LoRA")
         if self.train_blocks is not None:
             logger.info(f"train {self.train_blocks} blocks only")
+        logger.info(
+            f"train Lumina text/context refiner network: {self.train_text_refiner}, "
+            f"noise refiner network: {self.train_noise_refiner}"
+        )
 
         # create module instances
         def create_modules(
@@ -659,7 +680,28 @@ class LoRANetwork(torch.nn.Module):
             block_filter = None  # handled below with two calls
 
         self.unet_loras: List[Union[LoRAModule, LoRAInfModule]]
-        if self.train_blocks == "refiners":
+        if self.train_blocks == "all" and (not self.train_text_refiner or not self.train_noise_refiner):
+            self.unet_loras, skipped_un = create_modules(True, unet, target_replace_modules, filter="layers_")
+            if self.train_noise_refiner:
+                noise_loras, skipped_noise = create_modules(True, unet, target_replace_modules, filter="noise_refiner")
+                self.unet_loras.extend(noise_loras)
+                skipped_un += skipped_noise
+            if self.train_text_refiner:
+                context_loras, skipped_context = create_modules(True, unet, target_replace_modules, filter="context_refiner")
+                self.unet_loras.extend(context_loras)
+                skipped_un += skipped_context
+        elif self.train_blocks == "refiners" and (not self.train_text_refiner or not self.train_noise_refiner):
+            self.unet_loras = []
+            skipped_un = []
+            if self.train_noise_refiner:
+                noise_loras, skipped_noise = create_modules(True, unet, target_replace_modules, filter="noise_refiner")
+                self.unet_loras.extend(noise_loras)
+                skipped_un += skipped_noise
+            if self.train_text_refiner:
+                context_loras, skipped_context = create_modules(True, unet, target_replace_modules, filter="context_refiner")
+                self.unet_loras.extend(context_loras)
+                skipped_un += skipped_context
+        elif self.train_blocks == "refiners":
             # Refiners = noise_refiner + context_refiner, need two calls
             noise_loras, skipped_noise = create_modules(True, unet, target_replace_modules, filter="noise_refiner")
             context_loras, skipped_context = create_modules(True, unet, target_replace_modules, filter="context_refiner")

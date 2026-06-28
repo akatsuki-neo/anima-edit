@@ -1,0 +1,34 @@
+accelerate launch lumina_train_network.py \
+  --pretrained_model_name_or_path /root/autodl-tmp/ComfyUI/models/diffusion_models/lumina-2.safetensors \
+  --ae /root/autodl-tmp/ComfyUI/models/vae/ae.safetensors \
+  --gemma2 /root/autodl-tmp/ckn/gemma2 \
+  --train_data_dir /root/autodl-tmp/ckn/anima-edit-action-transfer-12-akatsuki-vlm \
+  --output_dir out_edit \
+  --output_name lumina_dora_no_refiner \
+  --network_module networks.dora \
+  --network_dim 128 \
+  --network_alpha 128 \
+  --network_train_unet_only \
+  --train_text_refiner_network false \
+  --train_noise_refiner_network false \
+  --learning_rate 1e-4 \
+  --optimizer_type AdamW \
+  --max_train_steps 5000000 \
+  --train_batch_size 2 \
+  --mixed_precision bf16 \
+  --save_precision bf16 \
+  --resolution 1024,1024 \
+  --enable_bucket \
+  --min_bucket_reso 256 \
+  --max_bucket_reso 2048 \
+  --bucket_reso_steps 16 \
+  --caption_extension .txt \
+  --multi_image_edit \
+  --gradient_checkpointing \
+  --log_with wandb \
+  --logging_dir logs \
+  --log_tracker_name lumina-edit \
+  --wandb_run_name lumina_dora_no_refiner \
+  --sample_every_n_steps 50 \
+  --sample_reference_dir /root/autodl-tmp/ckn/etest \
+  --save_every_n_steps 200

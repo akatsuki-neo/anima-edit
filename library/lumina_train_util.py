@@ -2,8 +2,10 @@ import inspect
 import argparse
 import math
 import os
+import re
 import numpy as np
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Any, Union, Generator
 
 import torch
@@ -94,8 +96,155 @@ def batchify(
             while start < len(prompts):
                 end = start + batch_size
                 batch = prompts[start:end]
-                yield batch
-                start = end
+            yield batch
+            start = end
+
+
+def _load_reference_sample_prompts(sample_reference_dir: str, max_references: int = 0) -> list[dict]:
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    ref_suffix_re = re.compile(r"_ref\d*$", re.IGNORECASE)
+    prompts = []
+    seen_targets = set()
+    for root, dirs, files in os.walk(sample_reference_dir):
+        dirs[:] = [dirname for dirname in dirs if not dirname.startswith(".")]
+        if any(part.startswith(".") for part in Path(root).relative_to(sample_reference_dir).parts):
+            continue
+        image_by_stem = {}
+        txt_by_stem = {}
+        for filename in sorted(files):
+            if filename.startswith("."):
+                continue
+            path = os.path.join(root, filename)
+            stem_name, ext = os.path.splitext(filename)
+            if ext.lower() not in image_exts:
+                if ext.lower() == ".txt":
+                    txt_by_stem[stem_name] = path
+                continue
+            image_by_stem.setdefault(stem_name, path)
+
+        sample_stems = set(image_by_stem)
+        sample_stems.update(txt_by_stem)
+        for stem_name in sorted(sample_stems):
+            if ref_suffix_re.search(stem_name):
+                continue
+            image_path = image_by_stem.get(stem_name)
+            txt_path = txt_by_stem.get(stem_name)
+            if txt_path is None and image_path is not None:
+                txt_path = os.path.splitext(image_path)[0] + ".txt"
+            if not os.path.isfile(txt_path):
+                continue
+            with open(txt_path, "r", encoding="utf-8") as f:
+                prompt = f.read().strip()
+            if not prompt:
+                continue
+            prompt_dict = train_util.line_to_prompt_dict(prompt)
+
+            ref_paths = []
+            direct_ref = image_by_stem.get(f"{stem_name}_ref")
+            if direct_ref is not None:
+                ref_paths.append(direct_ref)
+            ref_index = 1
+            while True:
+                ref_path = image_by_stem.get(f"{stem_name}_ref{ref_index}")
+                if ref_path is None:
+                    break
+                ref_paths.append(ref_path)
+                ref_index += 1
+            if image_path is None and not ref_paths:
+                continue
+
+            ref_key = tuple(os.path.normcase(os.path.abspath(path)) for path in (ref_paths or [image_path]))
+            prompt_key = (ref_key, prompt_dict.get("prompt", ""))
+            if prompt_key in seen_targets:
+                logger.warning(f"Skipping duplicate Lumina sample prompt: {txt_path}")
+                continue
+            seen_targets.add(prompt_key)
+            prompt_dict["image"] = ref_paths or image_path
+            prompts.append(prompt_dict)
+
+    if max_references > 0 and len(prompts) > max_references:
+        import random as _random
+
+        original_count = len(prompts)
+        _random.seed(42)
+        prompts = _random.sample(prompts, max_references)
+        logger.info(f"Trimmed Lumina sample references to {max_references} (from {original_count} total)")
+    logger.info(f"Loaded {len(prompts)} Lumina reference sample prompt(s) from: {sample_reference_dir}")
+    return prompts
+
+
+def _get_sample_reference_paths(prompt_dict):
+    image_paths = prompt_dict.get("image") or prompt_dict.get("reference_image") or prompt_dict.get("reference_images")
+    if image_paths is None:
+        return []
+    if isinstance(image_paths, str):
+        return [image_paths]
+    return list(image_paths)
+
+
+def _preprocess_reference_sample_image(image: Image.Image, args, nextdit: lumina_models.NextDiT) -> Image.Image:
+    image = image.convert("RGB")
+    max_area = getattr(args, "reference_max_area", 1024 * 1024)
+    if max_area is not None and max_area > 0 and image.width * image.height > max_area:
+        scale = (max_area / (image.width * image.height)) ** 0.5
+        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+
+    multiple_of = 8 * nextdit.patch_size
+    width = (image.width // multiple_of) * multiple_of
+    height = (image.height // multiple_of) * multiple_of
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Reference sample image is too small after alignment: {image.width}x{image.height}")
+    left = (image.width - width) // 2
+    top = (image.height - height) // 2
+    return image.crop((left, top, left + width, top + height))
+
+
+def _encode_sample_reference_images(prompt_dict, args, nextdit, vae, device, dtype):
+    image_paths = _get_sample_reference_paths(prompt_dict)
+    if not image_paths:
+        return [], []
+
+    refs = []
+    preview_images = []
+    org_vae_device = vae.device
+    vae.to(device)
+    try:
+        for image_path in image_paths:
+            image = _preprocess_reference_sample_image(Image.open(image_path), args, nextdit)
+            preview_images.append(image.copy())
+            image_tensor = torch.from_numpy(np.array(image).transpose(2, 0, 1)).float() / 255.0
+            image_tensor = image_tensor * 2.0 - 1.0
+            image_tensor = image_tensor.unsqueeze(0).to(device=device, dtype=vae.dtype)
+            latent = vae.encode(image_tensor).to(device=device, dtype=dtype)
+            refs.append(latent)
+    finally:
+        vae.to(org_vae_device)
+    return refs, preview_images
+
+
+def _make_reference_comparison(reference_images: list[Image.Image], output_image: Image.Image) -> Image.Image:
+    if not reference_images:
+        return output_image
+
+    target_height = output_image.height
+    resized_refs = []
+    for ref in reference_images:
+        ref = ref.convert("RGB")
+        if ref.height != target_height:
+            width = max(1, round(ref.width * target_height / ref.height))
+            ref = ref.resize((width, target_height), Image.Resampling.LANCZOS)
+        resized_refs.append(ref)
+
+    ref_canvas = Image.new("RGB", (sum(ref.width for ref in resized_refs), target_height), (255, 255, 255))
+    x_offset = 0
+    for ref in resized_refs:
+        ref_canvas.paste(ref, (x_offset, 0))
+        x_offset += ref.width
+
+    comparison = Image.new("RGB", (ref_canvas.width + output_image.width, target_height), (255, 255, 255))
+    comparison.paste(ref_canvas, (0, 0))
+    comparison.paste(output_image.convert("RGB"), (ref_canvas.width, 0))
+    return comparison
 
 
 @torch.no_grad()
@@ -138,7 +287,6 @@ def sample_images(
         if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
             return
         if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
             if epoch is None or epoch % args.sample_every_n_epochs != 0:
                 return
         else:
@@ -147,37 +295,35 @@ def sample_images(
             ):  # steps is not divisible or end of epoch
                 return
 
-    assert (
-        args.sample_prompts is not None
-    ), "No sample prompts found. Provide `--sample_prompts` / サンプルプロンプトが見つかりません。`--sample_prompts` を指定してください"
+    if args.sample_prompts is None and getattr(args, "sample_reference_dir", None) is None:
+        raise AssertionError("No sample prompts found. Provide `--sample_prompts` or `--sample_reference_dir`.")
 
     logger.info("")
-    logger.info(
-        f"generating sample images at step / サンプル画像生成 ステップ: {global_step}"
-    )
+    logger.info(f"generating sample images at step: {global_step}")
     if (
-        not os.path.isfile(args.sample_prompts)
+        getattr(args, "sample_reference_dir", None) is None
+        and not os.path.isfile(args.sample_prompts)
         and sample_prompts_gemma2_outputs is None
     ):
-        logger.error(
-            f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}"
-        )
+        logger.error(f"No prompt file: {args.sample_prompts}")
         return
 
-    distributed_state = (
-        PartialState()
-    )  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
+    distributed_state = PartialState()
 
     # unwrap nextdit and gemma2_model
     nextdit = accelerator.unwrap_model(nextdit)
     if gemma2_model is not None:
         gemma2_model = accelerator.unwrap_model(gemma2_model)
-    # if controlnet is not None:
-    #     controlnet = accelerator.unwrap_model(controlnet)
-    # print([(te.parameters().__next__().device if te is not None else None) for te in text_encoders])
 
-    prompts = train_util.load_prompts(args.sample_prompts)
-
+    if getattr(args, "sample_reference_dir", None) is not None:
+        prompts = _load_reference_sample_prompts(args.sample_reference_dir, getattr(args, "sample_max_references", 0))
+        if len(prompts) == 0:
+            logger.error(f"No image/txt sample pairs found in: {args.sample_reference_dir}")
+            return
+        for i, prompt_dict in enumerate(prompts):
+            prompt_dict["enum"] = i
+    else:
+        prompts = train_util.load_prompts(args.sample_prompts)
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -417,6 +563,20 @@ def sample_image_inference(
     #     controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
     #     controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)
 
+    reference_latents = None
+    reference_preview_images = []
+    if getattr(args, "multi_image_edit", False):
+        reference_latents = []
+        for prompt_dict in prompt_dicts:
+            refs, previews = _encode_sample_reference_images(prompt_dict, args, nextdit, vae, accelerator.device, weight_dtype)
+            reference_latents.append(refs)
+            reference_preview_images.append(previews)
+        if not any(len(refs) > 0 for refs in reference_latents):
+            reference_latents = None
+    else:
+        for prompt_dict in prompt_dicts:
+            reference_preview_images.append([Image.open(path).convert("RGB") for path in _get_sample_reference_paths(prompt_dict)])
+
     with accelerator.autocast():
         x = denoise(
             scheduler,
@@ -430,13 +590,15 @@ def sample_image_inference(
             guidance_scale=guidance_scale,
             cfg_trunc_ratio=cfg_trunc_ratio,
             renorm_cfg=renorm_cfg,
+            reference_latents=reference_latents,
+            reference_t_offset_scale=args.reference_t_offset_scale,
         )
 
     # Latent to image
     clean_memory_on_device(accelerator.device)
     org_vae_device = vae.device  # will be on cpu
     vae.to(accelerator.device)  # distributed_state.device is same as accelerator.device
-    for img, prompt_dict in zip(x, prompt_dicts):
+    for sample_index, (img, prompt_dict) in enumerate(zip(x, prompt_dicts)):
 
         img = (img / vae.scale_factor) + vae.shift_factor
 
@@ -451,6 +613,7 @@ def sample_image_inference(
 
         # Get single image
         image = Image.fromarray(img[0])
+        save_image = _make_reference_comparison(reference_preview_images[sample_index], image)
 
         # adding accelerator.wait_for_everyone() here should sync up and ensure that sample images are saved in the same order as the original prompt list
         # but adding 'enum' to the filename should be enough
@@ -460,7 +623,7 @@ def sample_image_inference(
         seed_suffix = "" if seed is None else f"_{seed}"
         i: int = int(prompt_dict.get("enum", 0))
         img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-        image.save(os.path.join(save_dir, img_filename))
+        save_image.save(os.path.join(save_dir, img_filename))
 
         # send images to wandb if enabled
         if "wandb" in [tracker.name for tracker in accelerator.trackers]:
@@ -470,7 +633,7 @@ def sample_image_inference(
 
             # not to commit images to avoid inconsistency between training and logging steps
             wandb_tracker.log(
-                {f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False
+                {f"sample_{i}": wandb.Image(save_image, caption=prompt)}, commit=False
             )  # positive prompt as a caption
 
     vae.to(org_vae_device)
@@ -615,6 +778,8 @@ def denoise(
     guidance_scale: float = 4.0,
     cfg_trunc_ratio: float = 0.25,
     renorm_cfg: float = 1.0,
+    reference_latents: Optional[List[List[Tensor]]] = None,
+    reference_t_offset_scale: int = 10,
 ):
     """
     Denoise an image using the NextDiT model.
@@ -658,8 +823,10 @@ def denoise(
         noise_pred_cond = model(
             img,
             current_timestep,
-            cap_feats=txt,  # Gemma2的hidden states作为caption features
-            cap_mask=txt_mask.to(dtype=torch.int32),  # Gemma2的attention mask
+            cap_feats=txt,
+            cap_mask=txt_mask.to(dtype=torch.int32),
+            reference_latents=reference_latents,
+            reference_t_offset_scale=reference_t_offset_scale,
         )
 
         # compute whether to apply classifier-free guidance based on current timestep
@@ -668,8 +835,10 @@ def denoise(
             noise_pred_uncond = model(
                 img,
                 current_timestep,
-                cap_feats=neg_txt,  # Gemma2的hidden states作为caption features
-                cap_mask=neg_txt_mask.to(dtype=torch.int32),  # Gemma2的attention mask
+                cap_feats=neg_txt,
+                cap_mask=neg_txt_mask.to(dtype=torch.int32),
+                reference_latents=reference_latents,
+                reference_t_offset_scale=reference_t_offset_scale,
             )
             noise_pred = noise_pred_uncond + guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
@@ -967,8 +1136,6 @@ def save_lumina_model_on_train_end(
     )
 
 
-# epochとstepの保存、メタデータにepoch/stepが含まれ引数が同じになるため、統合してている
-# on_epoch_end: Trueならepoch終了時、Falseならstep経過時
 def save_lumina_model_on_epoch_end_or_stepwise(
     args: argparse.Namespace,
     on_epoch_end: bool,
@@ -1023,71 +1190,62 @@ def save_lumina_model_on_epoch_end_or_stepwise(
 
 
 def add_lumina_train_arguments(parser: argparse.ArgumentParser):
-    parser.add_argument(
-        "--gemma2",
-        type=str,
-        help="path to gemma2 model (*.sft or *.safetensors), should be float16 / gemma2のパス（*.sftまたは*.safetensors）、float16が前提",
-    )
-    parser.add_argument(
-        "--ae",
-        type=str,
-        help="path to ae (*.sft or *.safetensors) / aeのパス（*.sftまたは*.safetensors）",
-    )
+    parser.add_argument("--gemma2", type=str, help="Path to Gemma2 model (*.sft or *.safetensors).")
+    parser.add_argument("--ae", type=str, help="Path to Lumina/Flux autoencoder (*.sft or *.safetensors).")
     parser.add_argument(
         "--gemma2_max_token_length",
         type=int,
         default=None,
-        help="maximum token length for Gemma2. if omitted, 256"
-        " / Gemma2の最大トークン長。省略された場合、256になります",
+        help="Maximum token length for Gemma2. If omitted, the tokenizer strategy default is used.",
     )
-
     parser.add_argument(
         "--timestep_sampling",
         choices=["sigma", "uniform", "sigmoid", "shift", "nextdit_shift", "flux_shift"],
         default="shift",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, Flux.1 and NextDIT.1 shifting. Default is 'shift'."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、Flux.1、NextDIT.1のシフト。デフォルトは'shift'です。",
+        help="Method to sample training timesteps.",
     )
     parser.add_argument(
         "--sigmoid_scale",
         type=float,
         default=1.0,
-        help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"の場合のみ有効）。',
+        help="Scale factor for sigmoid/shift timestep sampling.",
     )
     parser.add_argument(
         "--model_prediction_type",
         choices=["raw", "additive", "sigma_scaled"],
         default="raw",
-        help="How to interpret and process the model prediction: "
-        "raw (use as is), additive (add to noisy input), sigma_scaled (apply sigma scaling)."
-        " / モデル予測の解釈と処理方法："
-        "raw（そのまま使用）、additive（ノイズ入力に加算）、sigma_scaled（シグマスケーリングを適用）。",
+        help="How to interpret and process the Lumina model prediction.",
     )
     parser.add_argument(
         "--discrete_flow_shift",
         type=float,
         default=6.0,
-        help="Discrete flow shift for the Euler Discrete Scheduler, default is 6.0 / Euler Discrete Schedulerの離散フローシフト、デフォルトは6.0",
+        help="Discrete flow shift for the Euler discrete scheduler.",
     )
-    parser.add_argument(
-        "--use_flash_attn",
-        action="store_true",
-        help="Use Flash Attention for the model / モデルにFlash Attentionを使用する",
-    )
-    parser.add_argument(
-        "--use_sage_attn",
-        action="store_true",
-        help="Use Sage Attention for the model / モデルにSage Attentionを使用する",
-    )
-    parser.add_argument(
-        "--system_prompt",
-        type=str,
-        default="",
-        help="System prompt to add to the prompt / プロンプトに追加するシステムプロンプト",
-    )
+    parser.add_argument("--use_flash_attn", action="store_true", help="Use Flash Attention in Lumina.")
+    parser.add_argument("--use_sage_attn", action="store_true", help="Use Sage Attention in Lumina.")
+    parser.add_argument("--system_prompt", type=str, default="", help="System prompt to prepend during tokenization.")
     parser.add_argument(
         "--sample_batch_size",
         type=int,
         default=None,
-        help="Batch size to use for sampling, defaults to --training_batch_size value. Sample batches are bucketed by width, height, guidance scale, and seed / サンプリングに使用するバッチサイズ。デフォルトは --training_batch_size の値です。サンプルバッチは、幅、高さ、ガイダンススケール、シードによってバケット化されます",
+        help="Batch size for sampling. Defaults to --train_batch_size when omitted.",
+    )
+    parser.add_argument(
+        "--sample_reference_dir",
+        type=str,
+        default=None,
+        help="Directory of sample image/txt pairs. Files named *_ref, *_ref1, ... are used as reference images.",
+    )
+    parser.add_argument(
+        "--sample_max_references",
+        type=int,
+        default=0,
+        help="Maximum number of reference sample prompts to load from --sample_reference_dir. 0 means all.",
+    )
+    parser.add_argument(
+        "--blocks_to_swap",
+        type=int,
+        default=None,
+        help="Number of Lumina transformer blocks to swap between CPU/GPU.",
     )
