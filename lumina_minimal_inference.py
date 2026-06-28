@@ -3,10 +3,12 @@
 
 import logging
 import argparse
+import importlib
 import math
 import os
 import random
 import time
+import json
 from typing import Optional
 
 import einops
@@ -14,6 +16,7 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from PIL import Image
+from safetensors import safe_open
 from safetensors.torch import load_file
 from tqdm import tqdm
 from transformers import Gemma2Model
@@ -27,13 +30,147 @@ from library import (
     sd3_train_utils,
     strategy_lumina,
 )
-import networks.lora_lumina as lora_lumina
 from library.device_utils import get_preferred_device, init_ipex
 from library.utils import setup_logging, str_to_dtype
 
 init_ipex()
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def parse_network_args(network_args: Optional[list[str]]) -> dict:
+    net_kwargs = {}
+    if network_args is None:
+        return net_kwargs
+    for net_arg in network_args:
+        if "=" not in net_arg:
+            logger.warning(f"Skipping network arg without '=': {net_arg}")
+            continue
+        key, value = net_arg.split("=", 1)
+        net_kwargs[key] = value
+    return net_kwargs
+
+
+def load_safetensors_metadata(path: str) -> dict:
+    if os.path.splitext(path)[1] != ".safetensors":
+        return {}
+    with safe_open(path, framework="pt") as f:
+        metadata = f.metadata()
+    return metadata or {}
+
+
+def parse_network_args_metadata(metadata: dict) -> dict:
+    raw_args = metadata.get("ss_network_args")
+    if not raw_args:
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError:
+        logger.warning(f"Could not parse ss_network_args metadata: {raw_args}")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def infer_network_module(weights_sd: dict, metadata: dict, override: Optional[str] = None) -> str:
+    if override:
+        return override
+
+    metadata_module = metadata.get("ss_network_module")
+    if metadata_module:
+        if metadata_module == "networks.lora":
+            return "networks.lora_lumina"
+        return metadata_module
+
+    keys = list(weights_sd.keys())
+    if any(".lokr_" in key for key in keys):
+        return "networks.lokr"
+    if any(key.endswith(".dora_scale") or key.endswith(".dora_magnitude") for key in keys):
+        return "networks.dora"
+    if any(".hada_" in key for key in keys):
+        return "networks.loha"
+    return "networks.lora_lumina"
+
+
+def load_weights_file(path: str):
+    if os.path.splitext(path)[1] == ".safetensors":
+        return load_file(path)
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def preprocess_reference_image(image: Image.Image, args: argparse.Namespace, model: lumina_models.NextDiT) -> Image.Image:
+    image = image.convert("RGB")
+    max_area = getattr(args, "reference_max_area", 1024 * 1024)
+    if max_area is not None and max_area > 0 and image.width * image.height > max_area:
+        scale = math.sqrt(max_area / (image.width * image.height))
+        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+
+    multiple_of = 8 * model.patch_size
+    width = (image.width // multiple_of) * multiple_of
+    height = (image.height // multiple_of) * multiple_of
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Reference image is too small after alignment: {image.width}x{image.height}")
+
+    left = (image.width - width) // 2
+    top = (image.height - height) // 2
+    return image.crop((left, top, left + width, top + height))
+
+
+def encode_reference_images(
+    image_paths: list[str],
+    args: argparse.Namespace,
+    model: lumina_models.NextDiT,
+    ae: AutoEncoder,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Optional[list[list[torch.Tensor]]], list[Image.Image]]:
+    if not image_paths:
+        return None, []
+
+    org_ae_device = ae.device
+    ae.to(device)
+    refs = []
+    preview_images = []
+    try:
+        for image_path in image_paths:
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Reference image not found: {image_path}")
+            image = preprocess_reference_image(Image.open(image_path), args, model)
+            preview_images.append(image.copy())
+            image_tensor = torch.from_numpy(np.array(image).transpose(2, 0, 1)).float() / 255.0
+            image_tensor = image_tensor * 2.0 - 1.0
+            image_tensor = image_tensor.unsqueeze(0).to(device=device, dtype=ae.dtype)
+            with torch.no_grad():
+                latent = ae.encode(image_tensor).to(device=device, dtype=dtype)
+            refs.append(latent)
+    finally:
+        ae.to(org_ae_device)
+
+    return [refs] if refs else None, preview_images
+
+
+def make_reference_comparison(reference_images: list[Image.Image], output_image: Image.Image) -> Image.Image:
+    if not reference_images:
+        return output_image
+
+    target_height = output_image.height
+    resized_refs = []
+    for ref in reference_images:
+        ref = ref.convert("RGB")
+        if ref.height != target_height:
+            width = max(1, round(ref.width * target_height / ref.height))
+            ref = ref.resize((width, target_height), Image.Resampling.LANCZOS)
+        resized_refs.append(ref)
+
+    ref_canvas = Image.new("RGB", (sum(ref.width for ref in resized_refs), target_height), (255, 255, 255))
+    x_offset = 0
+    for ref in resized_refs:
+        ref_canvas.paste(ref, (x_offset, 0))
+        x_offset += ref.width
+
+    comparison = Image.new("RGB", (ref_canvas.width + output_image.width, target_height), (255, 255, 255))
+    comparison.paste(ref_canvas, (0, 0))
+    comparison.paste(output_image.convert("RGB"), (ref_canvas.width, 0))
+    return comparison
 
 
 def generate_image(
@@ -136,6 +273,15 @@ def generate_image(
     # print(f"Using timesteps: {timesteps}")
     # print(f"vs Lumina timesteps: {lumina_timestep}")  # should be the same
 
+    reference_latents, reference_preview_images = encode_reference_images(
+        args.reference_images,
+        args,
+        model,
+        ae,
+        device,
+        dtype,
+    )
+
     with torch.autocast(device_type=device.type, dtype=dtype), torch.no_grad():
         latents = lumina_train_util.denoise(
             scheduler,
@@ -149,6 +295,8 @@ def generate_image(
             guidance_scale,
             cfg_trunc_ratio,
             renorm_cfg,
+            reference_latents=reference_latents,
+            reference_t_offset_scale=args.reference_t_offset_scale,
         )
 
     if args.offload:
@@ -171,12 +319,13 @@ def generate_image(
     # 6. Save image
     #
     pil_image = Image.fromarray(image[0])
+    save_image = make_reference_comparison(reference_preview_images, pil_image)
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
     seed_suffix = f"_{seed}"
     output_path = os.path.join(output_dir, f"image_{ts_str}{seed_suffix}.png")
-    pil_image.save(output_path)
+    save_image.save(output_path)
     logger.info(f"Image saved to {output_path}")
 
 
@@ -243,6 +392,25 @@ def setup_parser() -> argparse.ArgumentParser:
         help="The factor to limit the maximum norm after guidance. Default: 1.0, 0.0 means no renormalization.",
     )
     parser.add_argument(
+        "--reference_images",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Reference image paths for Lumina edit mode. Multiple images are supported.",
+    )
+    parser.add_argument(
+        "--reference_t_offset_scale",
+        type=int,
+        default=10,
+        help="T-coordinate spacing between reference images for Lumina edit mode.",
+    )
+    parser.add_argument(
+        "--reference_max_area",
+        type=int,
+        default=1024 * 1024,
+        help="Maximum reference image area before aspect-preserving downscale. Set 0 to disable.",
+    )
+    parser.add_argument(
         "--use_flash_attn",
         action="store_true",
         help="Use flash attention for Lumina model",
@@ -253,11 +421,24 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Use sage attention for Lumina model",
     )
     parser.add_argument(
+        "--network_module",
+        type=str,
+        default=None,
+        help="Optional adapter network module override. By default it is inferred from metadata or weight keys.",
+    )
+    parser.add_argument(
         "--lora_weights",
         type=str,
         nargs="*",
         default=[],
-        help="LoRA weights, each argument is a `path;multiplier` (semi-colon separated)",
+        help="Adapter weights, each argument is a `path;multiplier` (semi-colon separated)",
+    )
+    parser.add_argument(
+        "--network_args",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Optional additional network args as key=value. Metadata ss_network_args is used by default when present.",
     )
     parser.add_argument("--merge_lora_weights", action="store_true", help="Merge LoRA weights to model")
     parser.add_argument(
@@ -292,7 +473,8 @@ if __name__ == "__main__":
     # Load Autoencoder
     ae = lumina_util.load_ae(args.ae_path, dtype=None, device="cpu")
 
-    # LoRA
+    # Additional network weights: LoRA / DoRA / LoKr / compatible modules.
+    cli_net_kwargs = parse_network_args(args.network_args)
     lora_models = []
     for weights_file in args.lora_weights:
         if ";" in weights_file:
@@ -301,15 +483,33 @@ if __name__ == "__main__":
         else:
             multiplier = 1.0
 
-        weights_sd = load_file(weights_file)
-        lora_model, _ = lora_lumina.create_network_from_weights(multiplier, None, ae, [gemma2], model, weights_sd, True)
+        metadata = load_safetensors_metadata(weights_file)
+        weights_sd = load_weights_file(weights_file)
+        network_module_name = infer_network_module(weights_sd, metadata, args.network_module)
+        network_module = importlib.import_module(network_module_name)
+        net_kwargs = parse_network_args_metadata(metadata)
+        net_kwargs.update(cli_net_kwargs)
+        logger.info(f"Loading adapter with module {network_module_name}: {weights_file}")
+        lora_model, weights_sd = network_module.create_network_from_weights(
+            multiplier,
+            weights_file,
+            ae,
+            [gemma2],
+            model,
+            weights_sd=weights_sd,
+            for_inference=True,
+            **net_kwargs,
+        )
 
         if args.merge_lora_weights:
-            lora_model.merge_to([gemma2], model, weights_sd)
+            lora_model.merge_to([gemma2], model, weights_sd, dtype=str_to_dtype(args.dtype), device=device)
         else:
             lora_model.apply_to([gemma2], model)
-            info = lora_model.load_state_dict(weights_sd, strict=True)
-            logger.info(f"Loaded LoRA weights from {weights_file}: {info}")
+            if hasattr(lora_model, "load_weights"):
+                info = lora_model.load_weights(weights_file)
+            else:
+                info = lora_model.load_state_dict(weights_sd, strict=False)
+            logger.info(f"Loaded {network_module_name} weights from {weights_file}: {info}")
             lora_model.to(device)
             lora_model.set_multiplier(multiplier)
             lora_model.eval()
@@ -345,7 +545,7 @@ if __name__ == "__main__":
         print("Entering interactive mode.")
         while True:
             print(
-                "\nEnter prompt (or 'exit'). Options: --w <int> --h <int> --s <int> --d <int> --g <float> --n <str> --ctr <float> --rcfg <float> --m <m1,m2...>"
+                "\nEnter prompt (or 'exit'). Options: --w <int> --h <int> --s <int> --d <int> --g <float> --n <str> --ctr <float> --rcfg <float> --r <img1,img2> --m <m1,m2...>"
             )
             user_input = input()
             if user_input.lower() == "exit":
@@ -360,6 +560,7 @@ if __name__ == "__main__":
             # Set defaults for each generation
             seed = None  # New random seed each time unless specified
             negative_prompt = args.negative_prompt  # Reset to default
+            reference_images = list(args.reference_images)
 
             for opt in options[1:]:
                 try:
@@ -385,6 +586,8 @@ if __name__ == "__main__":
                         cfg_trunc_ratio = float(value)
                     elif key == "rcfg":
                         renorm_cfg = float(value)
+                    elif key == "r":
+                        reference_images = [] if value == "-" else [path.strip() for path in value.split(",") if path.strip()]
                     elif key == "m":
                         multipliers = value.split(",")
                         if len(multipliers) != len(lora_models):
@@ -398,21 +601,26 @@ if __name__ == "__main__":
                 except (ValueError, IndexError) as e:
                     logger.error(f"Invalid value for option --{key}: '{value}'. Error: {e}")
 
-            generate_image(
-                model,
-                gemma2,
-                ae,
-                prompt,
-                args.system_prompt,
-                seed,
-                image_width,
-                image_height,
-                steps,
-                guidance_scale,
-                negative_prompt,
-                args,
-                cfg_trunc_ratio,
-                renorm_cfg,
-            )
+            original_reference_images = args.reference_images
+            args.reference_images = reference_images
+            try:
+                generate_image(
+                    model,
+                    gemma2,
+                    ae,
+                    prompt,
+                    args.system_prompt,
+                    seed,
+                    image_width,
+                    image_height,
+                    steps,
+                    guidance_scale,
+                    negative_prompt,
+                    args,
+                    cfg_trunc_ratio,
+                    renorm_cfg,
+                )
+            finally:
+                args.reference_images = original_reference_images
 
     logger.info("Done.")
