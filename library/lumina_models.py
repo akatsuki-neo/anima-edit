@@ -788,7 +788,7 @@ class FinalLayer(GradientCheckpointMixin):
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
 
-    def forward(self, x, c):
+    def _forward(self, x, c):
         scale = self.adaLN_modulation(c)
         x = modulate(self.norm_final(x), scale)
         x = self.linear(x)
