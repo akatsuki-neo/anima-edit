@@ -1243,9 +1243,3 @@ def add_lumina_train_arguments(parser: argparse.ArgumentParser):
         default=0,
         help="Maximum number of reference sample prompts to load from --sample_reference_dir. 0 means all.",
     )
-    parser.add_argument(
-        "--blocks_to_swap",
-        type=int,
-        default=None,
-        help="Number of Lumina transformer blocks to swap between CPU/GPU.",
-    )
