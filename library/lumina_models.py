@@ -1201,7 +1201,7 @@ class NextDiT(nn.Module):
 
         return x, attention_mask, freqs_cis, l_effective_cap_len, seq_lengths
 
-    def forward(
+    def _forward_impl(
         self,
         x: Tensor,
         t: Tensor,
@@ -1210,34 +1210,6 @@ class NextDiT(nn.Module):
         reference_latents: Optional[List[List[Tensor]]] = None,
         reference_t_offset_scale: int = 10,
     ) -> Tensor:
-        """
-        Forward pass of NextDiT.
-        Args:
-            x: (N, C, H, W) image latents
-            t: (N,) tensor of diffusion timesteps
-            cap_feats: (N, L, D) caption features
-            cap_mask: (N, L) caption attention mask
-
-        Returns:
-            x: (N, C, H, W) denoised latents
-        """
-        has_reference_latents = reference_latents is not None and any(len(refs or []) > 0 for refs in reference_latents)
-        if has_reference_latents and x.shape[0] > 1:
-            outputs = []
-            for sample_index in range(x.shape[0]):
-                sample_refs = [reference_latents[sample_index] or []]
-                outputs.append(
-                    self.forward(
-                        x=x[sample_index : sample_index + 1],
-                        t=t[sample_index : sample_index + 1],
-                        cap_feats=cap_feats[sample_index : sample_index + 1],
-                        cap_mask=cap_mask[sample_index : sample_index + 1],
-                        reference_latents=sample_refs,
-                        reference_t_offset_scale=reference_t_offset_scale,
-                    )
-                )
-            return torch.cat(outputs, dim=0)
-
         _, _, height, width = x.shape  # B, C, H, W
         t = self.t_embedder(t)  # (N, D)
         cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
@@ -1266,6 +1238,52 @@ class NextDiT(nn.Module):
         x = self.unpatchify(x, width, height, l_effective_cap_len, seq_lengths)
 
         return x
+
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        cap_feats: Tensor,
+        cap_mask: Tensor,
+        reference_latents: Optional[List[List[Tensor]]] = None,
+        reference_t_offset_scale: int = 10,
+    ) -> Tensor:
+        """
+        Forward pass of NextDiT.
+        Args:
+            x: (N, C, H, W) image latents
+            t: (N,) tensor of diffusion timesteps
+            cap_feats: (N, L, D) caption features
+            cap_mask: (N, L) caption attention mask
+
+        Returns:
+            x: (N, C, H, W) denoised latents
+        """
+        has_reference_latents = reference_latents is not None and any(len(refs or []) > 0 for refs in reference_latents)
+        if has_reference_latents and x.shape[0] > 1:
+            outputs = []
+            for sample_index in range(x.shape[0]):
+                sample_refs = [reference_latents[sample_index] or []]
+                outputs.append(
+                    self._forward_impl(
+                        x=x[sample_index : sample_index + 1],
+                        t=t[sample_index : sample_index + 1],
+                        cap_feats=cap_feats[sample_index : sample_index + 1],
+                        cap_mask=cap_mask[sample_index : sample_index + 1],
+                        reference_latents=sample_refs,
+                        reference_t_offset_scale=reference_t_offset_scale,
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        return self._forward_impl(
+            x=x,
+            t=t,
+            cap_feats=cap_feats,
+            cap_mask=cap_mask,
+            reference_latents=reference_latents,
+            reference_t_offset_scale=reference_t_offset_scale,
+        )
 
     def forward_with_cfg(
         self,
