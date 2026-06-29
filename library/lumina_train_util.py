@@ -63,7 +63,7 @@ def batchify(
         width = max(64, width - width % 8)  # round to divisible by 8
         guidance_scale = float(prompt_dict.get("scale", 3.5))
         sample_steps = int(prompt_dict.get("sample_steps", 38))
-        cfg_trunc_ratio = float(prompt_dict.get("cfg_trunc_ratio", 0.25))
+        cfg_trunc_ratio = float(prompt_dict.get("cfg_trunc_ratio", 1.0))
         renorm_cfg = float(prompt_dict.get("renorm_cfg", 1.0))
         seed = prompt_dict.get("seed", None)
         seed = int(seed) if seed is not None else None
@@ -455,7 +455,7 @@ def sample_image_inference(
     width = max(64, width - width % 8)  # round to divisible by 8
 
     guidance_scale = float(prompt_dicts[0].get("scale", 3.5))
-    cfg_trunc_ratio = float(prompt_dicts[0].get("cfg_trunc_ratio", 0.25))
+    cfg_trunc_ratio = float(prompt_dicts[0].get("cfg_trunc_ratio", 1.0))
     renorm_cfg = float(prompt_dicts[0].get("renorm_cfg", 1.0))
     sample_steps = int(prompt_dicts[0].get("sample_steps", 36))
     seed = prompt_dicts[0].get("seed", None)
@@ -791,7 +791,7 @@ def denoise(
     neg_txt_mask: Tensor,
     timesteps: Union[List[float], torch.Tensor],
     guidance_scale: float = 4.0,
-    cfg_trunc_ratio: float = 0.25,
+    cfg_trunc_ratio: float = 1.0,
     renorm_cfg: float = 1.0,
     reference_latents: Optional[List[List[Tensor]]] = None,
     reference_t_offset_scale: int = 10,
